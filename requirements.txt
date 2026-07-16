@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+matplotlib
+joblib
+shap
+streamlit-authenticator
+pyyaml
+scikit-learn
