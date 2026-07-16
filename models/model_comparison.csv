@@ -1,0 +1,5 @@
+model,MAE_RM,RMSE_RM,R2
+RandomForest,963,1763,0.604
+HistGradientBoosting,983,1777,0.597
+LinearRegression,1061,1867,0.555
+DecisionTree,1118,1972,0.504

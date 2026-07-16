@@ -1,0 +1,16 @@
+# Data and trained model artifacts (too large / regenerable — never commit)
+data/
+models/*.joblib
+
+# Secrets — SMTP credentials for the forgot-password email
+.streamlit/secrets.toml
+
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
