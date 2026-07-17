@@ -10,14 +10,17 @@ of the key factors, (4) improvement suggestions.
 
 Code quality: write simple, professional, explainable code — clear structure, sensible
 naming, and robust enough for a real system (input validation, graceful error handling).
-Avoid clever or over-optimized code. The student must be able to explain every line at
-a viva — add short comments and markdown cells explaining WHY, not just what.
+Avoid clever or over-optimized code. The student must be able to explain every line during the fianl year project presentation add short comments and markdown cells explaining WHY, not just what.
 
 ## Environment
 - Windows 11, Python 3.13 in `.venv` (activate: `.venv\Scripts\activate`)
-- Installed: pandas, numpy, scikit-learn, shap, streamlit, streamlit-authenticator, matplotlib
+- Installed: pandas, numpy, scikit-learn, shap, streamlit, streamlit-authenticator,
+  matplotlib, supabase (approved exception 2026-07-17 — dashboard persistence only)
 - Do NOT add new dependencies (no xgboost/lightgbm/spacy). scikit-learn only for models.
 - CPU only. Dataset fits in memory (16 GB RAM).
+- Deploy target: Streamlit Community Cloud; database: Supabase free tier (Postgres),
+  accessed via the official supabase client. Secrets live in `.streamlit/secrets.toml`
+  locally (git-ignored) and in the app's Secrets panel when deployed.
 
 ## Folder structure
 - `data/` — datasets (git-ignored). Main file: `data/jobstreet_cleaned_final.csv`
@@ -83,8 +86,11 @@ a viva — add short comments and markdown cells explaining WHY, not just what.
 
 ## Dashboard spec (dashboards/app.py)
 - Streamlit, run with `streamlit run dashboards/app.py`. Single page is fine.
-- Login/logout via streamlit-authenticator, 2 demo accounts (e.g. demo_user / supervisor),
-  hashed passwords in a config.yaml. App content only renders after login.
+- Login/logout via streamlit-authenticator. All accounts come from in-app registration
+  (no demo/seed accounts — removed 2026-07-17); bcrypt password hashes, prediction
+  history and profiles are stored in Supabase via `dashboards/db.py`. config.yaml holds
+  only non-secret cookie settings; the cookie signing key comes from st.secrets.
+  App content only renders after login (or guest mode).
 - Inputs: job title (text_input), category (selectbox), state (selectbox),
   employment type (selectbox), years of experience (slider 0–20), highest education
   (selectbox, 5 ordinal levels), skills (multiselect from saved skill list), optional

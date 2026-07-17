@@ -6,9 +6,9 @@ scenario comparison, History, Profile page, About page).
 Run from the project root:  .venv\\Scripts\\python.exe scripts\\test_dashboard.py
 
 Uses Streamlit's built-in testing harness (streamlit.testing.v1.AppTest) to
-drive dashboards/app.py without a browser. The dashboard's SQLite module is
-pointed at a TEMPORARY database file first, so these tests never touch the
-real data/dashboard.db.
+drive dashboards/app.py without a browser. The dashboard's database module
+(dashboards/db.py, Supabase) is pointed at an IN-MEMORY fake client first, so
+these tests never touch the network or real data.
 
 Known harness limits (verified manually in a browser instead):
 - login cookies (AppTest has no browser cookies),
@@ -17,12 +17,10 @@ Known harness limits (verified manually in a browser instead):
 """
 
 import sys
-import tempfile
 from pathlib import Path
 
 import bcrypt
 import joblib
-import pandas as pd
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "dashboards"))
@@ -37,10 +35,134 @@ emailer.send_password_email = lambda *args, **kwargs: False
 from streamlit.testing.v1 import AppTest
 
 APP_PATH = str(ROOT / "dashboards" / "app.py")
+# Injected via AppTest secrets; >= 32 bytes so PyJWT raises no key-length warning
+COOKIE_KEY = "test_cookie_signing_key_for_apptest_only_0000"
 
-# All tests share one throw-away database (later tests reuse earlier accounts)
-db.DB_PATH = Path(tempfile.mkdtemp()) / "test_dashboard.db"
-print(f"Temporary test database: {db.DB_PATH}\n")
+
+# --------------------------------------------------------------- fake database
+# The app stores everything in Supabase through dashboards/db.py. Tests must
+# not depend on the network or touch real data, so db._client() is replaced
+# with an in-memory fake that mimics the small slice of the supabase query API
+# db.py actually uses. Every real db.py code path (dict building, DataFrame
+# construction, skills parsing) still runs — only the HTTP layer is faked.
+# This is the same test seam the SQLite version offered via db.DB_PATH.
+class FakeResult:
+    def __init__(self, data):
+        self.data = data
+
+
+class FakeQuery:
+    """One pending operation on one table, built fluently like the real client:
+    table(x).select/insert/upsert/update/delete ... .eq/.in_/.order ... .execute()."""
+
+    PRIMARY_KEYS = {"users": "username", "profiles": "username", "predictions": "id"}
+
+    def __init__(self, client, table):
+        self._client = client
+        self._table = table
+        self._op = None
+        self._payload = None
+        self._filters = []
+        self._order = []
+
+    def select(self, *_columns):          # column list ignored: db.py reads by key
+        self._op = "select"
+        return self
+
+    def insert(self, row):
+        self._op, self._payload = "insert", dict(row)
+        return self
+
+    def upsert(self, row):
+        self._op, self._payload = "upsert", dict(row)
+        return self
+
+    def update(self, values):
+        self._op, self._payload = "update", dict(values)
+        return self
+
+    def delete(self):
+        self._op = "delete"
+        return self
+
+    def eq(self, column, value):
+        self._filters.append(lambda r, c=column, v=value: r.get(c) == v)
+        return self
+
+    def in_(self, column, values):
+        self._filters.append(lambda r, c=column, v=list(values): r.get(c) in v)
+        return self
+
+    def order(self, column, desc=False):
+        self._order.append((column, desc))
+        return self
+
+    def _matching(self, rows):
+        return [r for r in rows if all(f(r) for f in self._filters)]
+
+    def execute(self):
+        rows = self._client.tables[self._table]
+        pk = self.PRIMARY_KEYS[self._table]
+        if self._op == "select":
+            result = [dict(r) for r in self._matching(rows)]
+            for column, desc in reversed(self._order):   # stable multi-key sort
+                result.sort(key=lambda r: r[column], reverse=desc)
+            return FakeResult(result)
+        if self._op == "insert":
+            row = dict(self._payload)
+            if self._table == "predictions":
+                row["id"] = self._client.next_id
+                self._client.next_id += 1
+            if any(r[pk] == row.get(pk) for r in rows):
+                raise Exception(f'duplicate key violates "{self._table}_pkey"')
+            rows.append(row)
+            return FakeResult([dict(row)])
+        if self._op == "upsert":
+            row = dict(self._payload)
+            existing = [r for r in rows if r[pk] == row[pk]]
+            if existing:
+                existing[0].update(row)
+            else:
+                rows.append(row)
+            return FakeResult([dict(row)])
+        if self._op == "update":
+            matched = self._matching(rows)
+            for r in matched:
+                r.update(self._payload)
+            return FakeResult([dict(r) for r in matched])
+        if self._op == "delete":
+            removed = self._matching(rows)
+            self._client.tables[self._table] = [
+                r for r in rows if not any(r is x for x in removed)]
+            return FakeResult([dict(r) for r in removed])
+        raise AssertionError(f"no operation set for table {self._table}")
+
+
+class FakeSupabaseClient:
+    def __init__(self):
+        self.tables = {"users": [], "predictions": [], "profiles": []}
+        self.next_id = 1
+
+    def table(self, name):
+        return FakeQuery(self, name)
+
+
+FAKE_DB = FakeSupabaseClient()
+db._client = lambda: FAKE_DB
+print("Using an in-memory fake Supabase client (no network, no real data)\n")
+
+# Two pre-seeded TEST accounts (bcrypt hashes for demo123 / super123). They
+# exist only inside this fake store — the shipped app has no seeded accounts;
+# every real account comes from in-app registration.
+for _u, _n, _e, _h in [
+    ("demo_user", "Demo User", "demo_user@example.com",
+     "$2b$12$iO7iFvRtfQA2henT8sQIFuPfup7ZhzbTY5U7GNzvIrP8kkUS6s68u"),
+    ("supervisor", "Supervisor", "supervisor@example.com",
+     "$2b$12$KnCNvw1Jz9EnH9eNJUkQ7eM.g6g/yx4vtB17ceCCE/7F/ZE4YMmu2"),
+]:
+    FAKE_DB.tables["users"].append({
+        "username": _u, "name": _n, "email": _e, "password_hash": _h,
+        "created_at": "2026-07-17T00:00:00", "onboarded": True})
 
 PASSED = []
 
@@ -55,7 +177,10 @@ def check(label, condition, detail=""):
 
 
 def fresh_app():
-    return AppTest.from_file(APP_PATH, default_timeout=300)
+    at = AppTest.from_file(APP_PATH, default_timeout=300)
+    # The cookie signing key lives in st.secrets now (not in config.yaml)
+    at.secrets["auth"] = {"cookie_key": COOKIE_KEY}
+    return at
 
 
 def session_get(at, key, default=None):
@@ -158,7 +283,7 @@ check("prediction UI hidden before auth",
 check("demo-account hint removed from the landing page",
       "Demo accounts" not in all_text(at) and "demo123" not in all_text(at))
 seeded = db.load_credentials()["usernames"]
-check("demo accounts seeded from config.yaml into SQLite",
+check("test accounts visible through db.load_credentials()",
       set(seeded) == {"demo_user", "supervisor"}, str(set(seeded)))
 
 # ------------------------------------------------------------------- 2: login
@@ -172,9 +297,9 @@ check("error message shown", any("incorrect" in e.value for e in at.error))
 at = fresh_app()
 at.run()
 do_login(at, "demo_user", "demo123")
-check("demo_user/demo123 accepted (seed hashes still valid)",
+check("demo_user/demo123 accepted (test-seed hashes valid)",
       at.session_state["authentication_status"] is True)
-check("main app rendered after login (no onboarding for seeded accounts)",
+check("main app rendered after login (no onboarding for pre-seeded accounts)",
       has_button(at, "Predict my market salary"))
 check("user menu holds logout + change password",
       has_button(at, "Logout") and bool(text_inputs(at, "Current password")))
@@ -375,7 +500,7 @@ check("welcome message + onboarding shown right after registering",
       any("signed in as" in (s.value or "") for s in at.success)
       and has_button(at, "Skip for now"), all_text(at)[:300])
 users = db.load_credentials()["usernames"]
-check("new account persisted to SQLite", "testuser" in users)
+check("new account persisted to the database", "testuser" in users)
 check("password stored as working bcrypt hash",
       bcrypt.checkpw(b"Test@1234", users["testuser"]["password"].encode()))
 
@@ -399,7 +524,7 @@ check("two-word username registers and is auto-logged in",
       session_get(at, "authentication_status") is True
       and session_get(at, "username") == "lulu man",
       "; ".join(e.value for e in at.error))
-check("two-word account stored lowercased in SQLite (library lowercases)",
+check("two-word account stored lowercased in the database (library lowercases)",
       "lulu man" in db.load_credentials()["usernames"])
 
 at = fresh_app()
@@ -574,7 +699,7 @@ codes = at.get("code")
 check("new password displayed on screen", len(codes) > 0)
 new_password = codes[0].value
 new_hash = db.load_credentials()["usernames"]["testuser"]["password"]
-check("new hash persisted to SQLite", new_hash != old_hash)
+check("new hash persisted to the database", new_hash != old_hash)
 check("displayed password matches the stored hash",
       bcrypt.checkpw(new_password.encode(), new_hash.encode()))
 check("old password no longer works",
@@ -713,49 +838,20 @@ check("re-evaluation caveat removed (v6.3)", "current model" not in whatif_text)
 print("       takeaway: " + next((i.value for i in at.info if "Scenario" in (i.value or "")
                                   or "almost the same" in (i.value or "")), "(none)"))
 
-# ----------------------------------------- 12: pre-v6 database migration
-print("12. Migration: a v3-era database gains edu_level/profiles/onboarded")
-import sqlite3
-
-old_db_path = db.DB_PATH
-mig_path = Path(tempfile.mkdtemp()) / "v3_schema.db"
-conn = sqlite3.connect(mig_path)
-conn.execute("""CREATE TABLE users (username TEXT PRIMARY KEY, name TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL)""")
-conn.execute("""INSERT INTO users VALUES ('olduser', 'Old User', 'old@example.com',
-                'hash', '2026-07-14T12:00:00')""")
-conn.execute("""CREATE TABLE predictions (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL, created_at TEXT NOT NULL, job_title TEXT,
-                category TEXT, state TEXT, emp_type TEXT, experience_years INTEGER,
-                skills TEXT, salary_offered REAL, pred_low REAL, pred_point REAL,
-                pred_high REAL, verdict TEXT)""")
-conn.execute("""INSERT INTO predictions (username, created_at, job_title, category,
-                state, emp_type, experience_years, skills, salary_offered,
-                pred_low, pred_point, pred_high, verdict)
-                VALUES ('olduser', '2026-07-14T12:00:00', 'Clerk', 'Accounting',
-                'Johor', 'Full time', 2, 'excel', 0.0, 2500.0, 2800.0, 3100.0, '')""")
-conn.commit()
-conn.close()
-try:
-    db.DB_PATH = mig_path
-    db.init_db()
-    conn = sqlite3.connect(mig_path)
-    pred_cols = {r[1] for r in conn.execute("PRAGMA table_info(predictions)")}
-    user_cols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
-    tables = {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'")}
-    conn.close()
-    check("edu_level column added to the old predictions table",
-          "edu_level" in pred_cols, str(pred_cols))
-    check("profiles table created", "profiles" in tables, str(tables))
-    check("onboarded column added; existing account grandfathered",
-          "onboarded" in user_cols and not db.needs_onboarding("olduser"),
-          str(user_cols))
-    old_hist = db.list_predictions("olduser")
-    check("pre-v4 row still listable, edu_level empty (-> 'Not specified')",
-          len(old_hist) == 1 and pd.isna(old_hist["edu_level"].iloc[0]))
-finally:
-    db.DB_PATH = old_db_path
+# --------------------------------- 12: db-layer safety nets (Supabase version)
+# The old SQLite migration test is gone: the schema is now managed once in the
+# Supabase SQL editor (docs/DEPLOYMENT.md), not by the app. What remains worth
+# testing at this layer is the empty-history contract and profile isolation.
+print("12. Database layer: empty history shape, per-user profile isolation")
+empty = db.list_predictions("nobody_at_all")
+check("empty history still carries the full column set",
+      empty.empty and list(empty.columns) == db.PREDICTION_COLUMNS,
+      str(list(empty.columns)))
+check("profiles are per-user (unknown user -> None)",
+      db.load_profile("nobody_at_all") is None)
+check("save_profile keeps ONE row per user (upsert, not append)",
+      len(FAKE_DB.tables["profiles"]) == len(
+          {r["username"] for r in FAKE_DB.tables["profiles"]})
+      and len(FAKE_DB.tables["profiles"]) >= 2)   # onboarder + demo_user saved above
 
 print(f"\nAll {len(PASSED)} checks passed.")

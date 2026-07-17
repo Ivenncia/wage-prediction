@@ -6,10 +6,10 @@ The app loads ONLY the artifacts saved in models/ by the notebooks — it never
 reads the training CSV. If the models have not been trained yet, it shows a
 friendly message instead of crashing.
 
-Accounts and saved predictions live in a SQLite database (data/dashboard.db,
-see db.py). Visitors can log in, register a new account, recover a forgotten
-password, or continue as a guest — guests can predict but must log in to save
-results to their history. Newly registered accounts get a one-time optional
+Accounts and saved predictions live in a Supabase (Postgres) database in the
+cloud (see db.py), so data survives redeploys of the app. Visitors can log in,
+register a new account, recover a forgotten password, or continue as a guest —
+guests can predict but must log in to save results to their history. Newly registered accounts get a one-time optional
 onboarding step (education / location / experience / skills) that seeds their
 profile.
 
@@ -43,7 +43,7 @@ MODELS_DIR = APP_DIR.parent / "models"
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-import db        # SQLite persistence (users + prediction history + profiles)
+import db        # Supabase persistence (users + prediction history + profiles)
 import emailer   # forgot-password email via smtplib
 
 # Every artifact the dashboard needs, by the exact names the notebooks save them
@@ -134,10 +134,32 @@ def load_auth_config():
 
 config = load_auth_config()
 
-# The database is the source of truth for accounts. The config.yaml demo
-# accounts are only used to seed it the very first time it is created.
-db.init_db(seed_users=config["credentials"]["usernames"])
-credentials = db.load_credentials()
+# The database (Supabase) is the single source of truth for accounts — every
+# account comes from in-app registration. If the database is unreachable or
+# not configured, stop with a setup message instead of a stack trace (the
+# same friendly-gate pattern as the missing-artifacts check further down).
+try:
+    credentials = db.load_credentials()
+except db.DatabaseError as exc:
+    st.error(str(exc))
+    st.stop()
+except Exception:
+    st.error("Could not reach the database. Check the [supabase] settings in "
+             ".streamlit/secrets.toml (or the deployed app's Secrets panel), "
+             "your internet connection, and that the Supabase project is not "
+             "paused.")
+    st.stop()
+
+# The cookie signing key lives in st.secrets, NOT in config.yaml: config.yaml
+# is committed to git, and anyone who knows the signing key could forge a
+# login cookie on the live app.
+try:
+    cookie_key = st.secrets["auth"]["cookie_key"]
+except (KeyError, FileNotFoundError):
+    st.error("Missing cookie signing key. Add an [auth] section with "
+             "'cookie_key' to .streamlit/secrets.toml (or the deployed "
+             "app's Secrets panel).")
+    st.stop()
 
 
 class MultiWordUsernameValidator(stauth.Validator):
@@ -154,7 +176,7 @@ class MultiWordUsernameValidator(stauth.Validator):
 authenticator = stauth.Authenticate(
     credentials,
     config["cookie"]["name"],
-    config["cookie"]["key"],
+    cookie_key,
     config["cookie"]["expiry_days"],
     validator=MultiWordUsernameValidator(),
 )

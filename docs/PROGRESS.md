@@ -921,3 +921,115 @@ of 25th/75th percentiles anywhere — users should not be shown how the range is
   land signed-in on the onboarding card, and a page refresh should keep you signed
   in (cookie). Re-screenshot the landing page (demo hint gone) and the hero card
   (caption gone) for the report figures.
+
+---
+
+## Dashboard v7: SQLite → Supabase migration for live deployment (2026-07-17)
+
+Files: dashboards/db.py (rewritten), dashboards/app.py (startup block + docstring),
+dashboards/config.yaml (credentials + cookie key removed), .streamlit/secrets.toml
+(new [supabase] + [auth] sections), requirements.txt (+supabase), CLAUDE.md
+(environment + dashboard spec updated), scripts/test_dashboard.py (suite 114 → 113),
+docs/DEPLOYMENT.md (new), data/dashboard.db (deleted). No notebook, model-artifact,
+emailer or prediction/UI logic changes.
+
+### (a) Purpose
+The app is being deployed to Streamlit Community Cloud, whose container filesystem
+is ephemeral — the local SQLite file would be wiped on every redeploy/restart, losing
+all accounts and history. Persistence moved to a managed Postgres database on the
+Supabase free tier. Student decisions (via questions): official supabase-py client
+(not raw SQL over psycopg2); complete fresh start with the demo accounts
+(demo_user/supervisor) REMOVED entirely — no seeding, all accounts come from in-app
+registration; deploy target Streamlit Community Cloud. Auth stays with
+streamlit-authenticator — Supabase is only the data store, not the auth system.
+
+### (b) What was built
+1. **db.py rewritten** (the 11 surviving public functions keep their exact
+   signatures, so app.py's ~18 call sites are untouched): the supabase client (REST over HTTPS — no connection
+   strings/pooling) is created once behind @st.cache_resource; `_client()` is a
+   late-bound accessor so tests can swap in a fake; `DatabaseError` raised when
+   [supabase] secrets are missing. `init_db()` DELETED — the schema is created once
+   in the Supabase SQL editor (DDL in docs/DEPLOYMENT.md), and there is no seeding.
+   SQLite-isms replaced: AUTOINCREMENT → identity column (insert returns the new id
+   in the REST response, replacing cursor.lastrowid); INSERT OR REPLACE → upsert;
+   PRAGMA migration guards dropped (no legacy DBs to support — profiles also drops
+   the v6-era empty legacy columns, and users.onboarded becomes a real boolean).
+   `list_predictions` orders by created_at DESC then id DESC (stable within one
+   second) and returns an empty DataFrame WITH the 15 expected columns when a user
+   has no rows (the REST API returns [] — no column names to infer, and the History
+   page needs them). `_now()` stamps rows in Asia/Kuala_Lumpur time minus the offset
+   suffix — the deployed server runs in UTC, which would otherwise show history
+   times 8 h behind Malaysia. delete_predictions int()-casts ids (numpy int64 from
+   the dataframe selection is not JSON-serialisable).
+2. **Security model**: RLS enabled on all three tables with NO policies → the
+   public/publishable key can read nothing; the app uses the SECRET key, which
+   bypasses RLS and lives only in .streamlit/secrets.toml (git-ignored) locally and
+   the Secrets panel on Streamlit Cloud. The cookie SIGNING key also moved out of
+   the committed config.yaml into st.secrets ([auth] cookie_key) — the old key was
+   burned (it is in git history), a fresh random one was generated; config.yaml now
+   holds only the cookie name + expiry. app.py wraps the startup
+   `db.load_credentials()` and the cookie-key read in friendly st.error + st.stop()
+   gates (same pattern as the missing-artifacts check).
+3. **Test suite**: the seam moved from `db.DB_PATH = <temp file>` to
+   `db._client = lambda: FAKE_DB` — an in-memory FakeSupabaseClient (~100 lines)
+   implementing exactly the query-builder slice db.py uses
+   (table/select/insert/upsert/update/delete/eq/in_/order/execute, auto-increment
+   ids, PK enforcement, stable multi-key ordering). All real db.py code paths still
+   run; only HTTP is faked. demo_user/supervisor now exist ONLY as pre-seeded rows
+   in the fake store (bcrypt hashes moved from config.yaml into the test script) so
+   the login-driven checks kept working unchanged. The cookie key is injected via
+   `at.secrets["auth"]` in fresh_app() (32+ chars, else PyJWT logs a key-length
+   warning). The v3-era SQLite migration test (4 checks) was removed — schema is no
+   longer app-managed — replaced by 3 db-layer checks: empty history carries the
+   full column set, unknown user → profile None, upsert keeps one profile row per
+   user.
+4. **docs/DEPLOYMENT.md** (new): step-by-step Supabase setup (project in the
+   Singapore region, the full DDL, which key to copy and why NOT the publishable
+   one, local verification) + Streamlit Community Cloud deploy (secrets panel,
+   Python version) + gotchas (free tier pauses after ~1 week idle — restore from
+   the Supabase dashboard before a demo).
+
+### (c) Verification
+- scripts/test_dashboard.py: **113/113 checks pass** (was 114: −4 migration,
+  +3 db-layer), console clean (no key-length or session-state warnings; the known
+  AppTest cookie noise remains). Register → auto-login → onboarding → predict →
+  auto-save → history → what-if → profile → forgot/change password → logout all
+  green against the fake client on the first full run.
+- Headless boot: streamlit run → /healthz 200.
+- Grep sweep: zero functional references to sqlite/DB_PATH/dashboard.db/demo
+  accounts left in dashboards/ (test-fake seeds and explanatory comments excepted);
+  data/dashboard.db (32 KB local test data) deleted per the fresh-start decision.
+- NOT yet verified (needs the student's Supabase project): the real end-to-end
+  smoke test — fill [supabase] secrets, register, save, check rows in the Table
+  Editor, restart, log in again (steps in DEPLOYMENT.md Part A4).
+
+### (d) Design decisions
+- **supabase-py over raw SQL**: no session-pooler/IPv4 concerns on Streamlit Cloud,
+  no connection-limit management on the free tier, one dependency instead of two
+  (SQLAlchemy + psycopg2), and query calls read almost like the SQL they replace.
+- **Same public db.py API**: keeps the migration surface to one module; every
+  app.py call site and most tests unchanged.
+- **Timestamps stay TEXT ISO strings** (not timestamptz): identical History-table
+  display and lexicographic ordering as before; timezone correctness handled at
+  write time via zoneinfo. Defensible simplification, noted as such.
+- **No Supabase Auth**: the persistence problem needed a database, not a new auth
+  system; streamlit-authenticator + bcrypt hashes in the users table carry over 1:1.
+- **Demo accounts became test fixtures**: the requirement was "no demo accounts in
+  the real system" — the fake store still seeds them so 20+ existing login checks
+  did not need rewriting.
+
+### (e) Limitations / student actions
+- Every db call is now a network round-trip (~50–150 ms to Singapore) instead of a
+  local file read — imperceptible for this single-user-per-session app; the client
+  itself is cached, calls are not (auth data must stay fresh across sessions).
+- The FakeSupabaseClient mimics, not proves, PostgREST behaviour — the real-network
+  path is covered by the manual smoke test in DEPLOYMENT.md Part A4.
+- Free-tier pause (~1 week idle) will make the deployed app show the friendly
+  "could not reach the database" error until the project is restored — restore it
+  before any demo/viva.
+- STUDENT: (1) create the Supabase project and run the DDL (DEPLOYMENT.md Part A —
+  ~10 min), fill [supabase] in .streamlit/secrets.toml, then run the Part A4 smoke
+  test; (2) deploy per Part B and paste the secrets into the Streamlit Cloud panel;
+  (3) the old demo accounts are gone — register your own accounts for the viva
+  demo; (4) if the repo was ever public, consider the old cookie key compromised
+  (already replaced) and never commit secrets.toml.

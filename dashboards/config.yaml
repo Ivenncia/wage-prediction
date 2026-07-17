@@ -1,20 +1,8 @@
 # Authentication config for the wage prediction dashboard (streamlit-authenticator).
-# Two demo accounts for the FYP demo / viva:
-#   demo_user  -> password: demo123
-#   supervisor -> password: super123
-# Passwords below are bcrypt HASHES (generated with streamlit_authenticator.Hasher);
-# the plaintext never appears in the app code.
+# Only non-secret cookie settings live here. The cookie SIGNING KEY is read from
+# st.secrets ([auth] cookie_key) because this file is committed to git, and the
+# key must never be public. All accounts come from in-app registration and are
+# stored in the Supabase database (see db.py) — no accounts are defined here.
 cookie:
   name: wage_dashboard_auth
-  key: fyp_wage_prediction_2026_signature_key
   expiry_days: 30
-credentials:
-  usernames:
-    demo_user:
-      name: Demo User
-      email: demo_user@example.com
-      password: $2b$12$iO7iFvRtfQA2henT8sQIFuPfup7ZhzbTY5U7GNzvIrP8kkUS6s68u
-    supervisor:
-      name: Supervisor
-      email: supervisor@example.com
-      password: $2b$12$KnCNvw1Jz9EnH9eNJUkQ7eM.g6g/yx4vtB17ceCCE/7F/ZE4YMmu2
