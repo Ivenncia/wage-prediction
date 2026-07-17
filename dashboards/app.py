@@ -21,6 +21,7 @@ keep-alive below. Styling comes from native Streamlit theming
 (.streamlit/config.toml) and bordered containers only — no custom HTML/CSS.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -138,11 +139,24 @@ config = load_auth_config()
 db.init_db(seed_users=config["credentials"]["usernames"])
 credentials = db.load_credentials()
 
+
+class MultiWordUsernameValidator(stauth.Validator):
+    """The library's default username rule rejects spaces, so a natural
+    username like "Lulu Man" could not register. This relaxes the rule to
+    1-3 words separated by single spaces (the library lowercases and strips
+    usernames on both registration and login, so casing stays consistent)."""
+
+    def validate_username(self, username: str) -> bool:
+        return bool(re.match(r"^[a-zA-Z0-9_-]{1,20}( [a-zA-Z0-9_-]{1,20}){0,2}$",
+                             username))
+
+
 authenticator = stauth.Authenticate(
     credentials,
     config["cookie"]["name"],
     config["cookie"]["key"],
     config["cookie"]["expiry_days"],
+    validator=MultiWordUsernameValidator(),
 )
 
 
@@ -249,7 +263,6 @@ if not st.session_state.get("guest_mode") and not st.session_state.get("authenti
             authenticator.login(location="main")   # also restores a valid login cookie
             if st.session_state.get("authentication_status") is False:
                 st.error("Username or password is incorrect.")
-            st.caption("Demo accounts: `demo_user` / `demo123` or `supervisor` / `super123`.")
 
         with tab_register:
             try:
@@ -261,7 +274,16 @@ if not st.session_state.get("guest_mode") and not st.session_state.get("authenti
                     # add_user marks the account for the one-time onboarding flow.
                     db.add_user(reg_username, reg_name, reg_email,
                                 credentials["usernames"][reg_username]["password"])
-                    st.success(f"Account **{reg_username}** created — you can now log in.")
+                    # Log the new account in right away — the token path is the
+                    # library's own cookie-restore mechanism (it fills the same
+                    # session-state keys a form login does), and set_cookie keeps
+                    # the session alive across a page refresh. The hub is wiped
+                    # below in this same run, so the welcome message is shown in
+                    # the app body via the one-shot flag.
+                    authenticator.authentication_controller.login(
+                        token={"username": reg_username})
+                    authenticator.cookie_controller.set_cookie()
+                    st.session_state["just_registered"] = True
             except Exception as exc:  # RegisterError: duplicate user/email, weak password, ...
                 st.error(str(exc))
 
@@ -338,6 +360,12 @@ with col_user:
         with st.popover("Guest", width="stretch"):
             st.write("Browsing as **guest** — predictions are not saved.")
             st.button("Log in / Register", on_click=exit_guest_mode)
+
+# One-shot confirmation after registering: the account was created inside the
+# hub (which is wiped once the auto-login completes), so the message renders
+# here in the app body instead — above the onboarding card a new account sees.
+if logged_in and st.session_state.pop("just_registered", False):
+    st.success(f"Account created — you are signed in as **{display_name}**.")
 
 
 # ---------------------------------------------------------- artifact loading
@@ -884,7 +912,7 @@ def plot_range_comparison(scenarios):
     ax.tick_params(colors=CHART_MUTED, labelsize=9, length=0)
     plt.setp(ax.get_yticklabels(), color=CHART_TEXT)
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"RM {v:,.0f}"))
-    ax.set_xlabel("Predicted monthly salary range (P25 – P75)",
+    ax.set_xlabel("Predicted monthly salary range",
                   fontsize=9, color=CHART_MUTED)
     ax.margins(x=0.10, y=0.40)   # air for the labels above and below each interval
     fig.tight_layout()
@@ -1157,9 +1185,6 @@ if page == NAV_PREDICT:
             fig = plot_salary_range(low, point, high, offered if offered > 0 else None)
             st.pyplot(fig)
             plt.close(fig)
-            st.caption(f"Half of comparable job ads pay inside the blue band — "
-                       f"RM {low:,.0f} to RM {high:,.0f} (the 25th–75th percentile "
-                       f"of the market).")
 
             if result["verdict"] == "BELOW":
                 st.error(f"Your salary of RM {offered:,.0f} is **below the market "
@@ -1219,10 +1244,6 @@ if page == NAV_PREDICT:
                         st.markdown(f"{icon} {r['sentence']}")
                         sign = "+" if r["rm"] >= 0 else "−"
                         st.caption(f"≈ {sign}RM {abs(r['rm']):,.0f} ({r['pct']:+.0f}%)")
-                    st.caption("RM effects are approximate — the factors interact, "
-                               "so they do not add up exactly. \"A typical job ad\" "
-                               "is the average of the background sample the "
-                               "explainer compares against.")
 
                     # The same groups as a signed bar chart, for visual readers
                     fig = plot_signed_bars([(r["label"], r["pct"]) for r in shown])
@@ -1388,9 +1409,6 @@ elif page == NAV_WHATIF:
                                      "(optional detail)"):
                         st.pyplot(plot_curves_comparison(scenarios))
                         plt.close("all")
-                    st.caption("Re-evaluated with the current model — numbers can "
-                               "differ slightly from the saved rows if the models "
-                               "were retrained since.")
 
 # ================================================================ history page
 elif page == NAV_HISTORY:

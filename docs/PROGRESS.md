@@ -834,3 +834,90 @@ to v6.1; no notebook/db/artifact changes.
   come from the same model.
 - v6.1's student-action note said the clean form shows "2 years" — superseded: it now
   shows 0 years.
+
+---
+
+## Dashboard v6.3: auto-login after register, multi-word usernames, demo/technical copy removed (2026-07-17)
+
+Files: dashboards/app.py, scripts/test_dashboard.py (suite 105 → 114), docs/PROGRESS.md.
+No notebook, db.py, emailer.py or artifact changes.
+
+### (a) Purpose
+Student's "professional system, not a demo" list: (1) auto-login right after
+registration; (2) usernames of 2–3 words ("Lulu Man") must be able to register;
+(3) remove the demo-accounts hint from the landing page; (4) remove the blue-band
+percentile caption, the "RM effects are approximate / background sample" caption and
+the what-if "Re-evaluated with the current model" caption; (5) no user-visible mention
+of 25th/75th percentiles anywhere — users should not be shown how the range is computed.
+
+### (b) What changed
+1. **Multi-word usernames.** Root cause: streamlit-authenticator 0.4.2's default
+   `Validator.validate_username` regex `[a-zA-Z0-9_-]{1,20}` has no space, so any
+   two-word username was rejected at registration. Fix: `MultiWordUsernameValidator`
+   subclass in app.py (1–3 words of `[a-zA-Z0-9_-]{1,20}` separated by single spaces)
+   passed to `stauth.Authenticate(validator=...)`. Verified in library source: the
+   controller lowercases + strips usernames on BOTH register and login, so "Lulu Man"
+   is stored and logged in as "lulu man" — consistent either way; SQLite PK unaffected.
+2. **Auto-login after registration.** After `db.add_user(...)` the register tab now
+   calls `authenticator.authentication_controller.login(token={"username": ...})` —
+   the library's own cookie-restore path, which fills the same session-state keys a
+   form login does — then `cookie_controller.set_cookie()` so a browser refresh stays
+   logged in. The existing hub fall-through (`hub.empty()` when authentication_status
+   turns True mid-run) shows the app in the same run; a new account lands on the
+   onboarding card as before. The old "you can now log in" success was removed (the
+   hub it rendered in is wiped in that same run); instead a one-shot `just_registered`
+   flag shows "Account created — you are signed in as **Name**." in the app body,
+   above onboarding. The guest pending-save contract is untouched: the flag survives
+   onboarding and the prediction still auto-saves (re-tested).
+3. **Copy removals** (all rendered strings, code comments kept): demo-accounts caption
+   on the login tab; "Half of comparable job ads pay inside the blue band … 25th–75th
+   percentile" hero caption; "RM effects are approximate … background sample" caption
+   in Why-this-estimate; "Re-evaluated with the current model …" caption on What-if;
+   comparison range chart x-label "(P25 – P75)" dropped → "Predicted monthly salary
+   range". Kept: the "A typical Malaysian job ad pays around RM X" anchor sentence and
+   the student's own About copy ("where half of comparable advertisements pay" — no
+   percentile language).
+
+### (c) Verification
+- scripts/test_dashboard.py: **114/114 checks pass** (was 105). Registration test
+  rewritten around a shared `do_register` helper: auto-login asserted
+  (authentication_status True + username set + onboarding card + welcome success in
+  the SAME session, no manual login); duplicate/weak-password attempts moved to a
+  fresh hub (the old session is now logged in). New: "Lulu Man" registers and lands
+  logged in as "lulu man"; stored lowercased in SQLite; fresh-session login typing
+  "Lulu Man" works; a four-word username is rejected and not persisted. 6b flows
+  drop their post-register `do_login` calls (register lands logged-in now) — the
+  stale-form wipe and pending-save auto-save still pass unchanged. New absence
+  checks: hub has no "Demo accounts"/"demo123"; results page has no "percentile"/
+  "blue band"/"P25"/"P75"/"RM effects are approximate"/"background sample"; What-if
+  has no "current model" caveat.
+- Headless boot: streamlit run → /healthz 200, console clean.
+- Grep over app.py rendered strings: zero hits for all removed phrases.
+
+### (d) Design decisions
+- **Token login path, not hand-set session keys**: `login(token=...)` is what the
+  library itself runs when restoring a cookie, so every key (email/name/roles/
+  authentication_status/username) is set exactly as a real login sets them, and the
+  logged_in bookkeeping stays consistent. `set_cookie()` is the same call the login
+  widget makes on success (already exercised under AppTest, so no new harness risk).
+- **Username rule stays conservative**: same character class as the library default,
+  just 1–3 space-separated words, ≤20 chars per word — nothing that could break the
+  SQLite PK, the credentials dict, or the cookie payload.
+- The welcome message lives in the app body behind a one-shot flag because anything
+  rendered inside the hub container is wiped by `hub.empty()` in the registration run.
+
+### (e) Limitations / student actions
+- Usernames are still lowercased by the library on registration AND login — "Lulu
+  Man" displays as username "lulu man" (the display NAME keeps its casing; only the
+  login identifier is lowercase). Worth one line in the report's user-management text.
+- The removed captions carried honest caveats (quantile meaning of the band, SHAP
+  interaction approximation, retrain drift on What-if). The information is gone from
+  the UI by explicit product decision; the report can still state these caveats —
+  the numbers themselves are unchanged.
+- AppTest cookie noise ("Invalid token type. Token must be a <class 'bytes'>") now
+  also appears after registration runs (set_cookie in a harness without a browser) —
+  same pre-existing, cosmetic noise the login path always produced.
+- STUDENT: in a real browser, register a throwaway 2-word account once — you should
+  land signed-in on the onboarding card, and a page refresh should keep you signed
+  in (cookie). Re-screenshot the landing page (demo hint gone) and the hero card
+  (caption gone) for the report figures.

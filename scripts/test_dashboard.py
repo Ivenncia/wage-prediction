@@ -102,6 +102,19 @@ def do_login(at, user, password):
     at.run()
 
 
+def do_register(at, first, last, email, username, password):
+    """Fill and submit the hub's register tab. Since v6.3 a successful
+    registration logs the account in automatically in the same run."""
+    text_inputs(at, "First name")[0].input(first)
+    text_inputs(at, "Last name")[0].input(last)
+    text_inputs(at, "Email")[0].input(email)
+    text_inputs(at, "Username")[1].input(username)       # [0] is the login tab's
+    text_inputs(at, "Password")[1].input(password)       # [0] is the login tab's
+    text_inputs(at, "Repeat password")[0].input(password)
+    find_button(at, "Register").click()
+    at.run()
+
+
 EDU_LEVELS = ["Not specified", "SPM / secondary school", "Diploma",
               "Bachelor's degree", "Master's / PhD"]   # must match app.py
 NAV_PREDICT = "Predict"                                # must match app.py
@@ -142,6 +155,8 @@ check("login/register/forgot + guest button present",
       and has_button(at, "Continue as guest"))
 check("prediction UI hidden before auth",
       not has_button(at, "Predict my market salary"))
+check("demo-account hint removed from the landing page",
+      "Demo accounts" not in all_text(at) and "demo123" not in all_text(at))
 seeded = db.load_credentials()["usernames"]
 check("demo accounts seeded from config.yaml into SQLite",
       set(seeded) == {"demo_user", "supervisor"}, str(set(seeded)))
@@ -221,6 +236,14 @@ check("experience curve computed (21 positive RM values)",
 page_text = all_text(at)
 check("no explanation/tips warnings",
       not any("unavailable" in (w.value or "") for w in at.warning))
+
+# --- v6.3: technical model copy removed from the results page ------------------
+check("no percentile language anywhere on the results page",
+      "percentile" not in page_text and "blue band" not in page_text
+      and "P25" not in page_text and "P75" not in page_text)
+check("SHAP interaction caveat removed",
+      "RM effects are approximate" not in page_text
+      and "background sample" not in page_text)
 
 # --- v6: concept-level explanation ---------------------------------------------
 check("baseline anchor sentence present",
@@ -340,45 +363,58 @@ check("history page points to the What-if page for comparisons",
       "What-if Analysis" in all_text(at))
 
 # ------------------------------------------------------------- 5: registration
-print("5. Registration: valid, duplicate, weak password")
+print("5. Registration: auto-login, multi-word usernames, duplicate, weak password")
 at = fresh_app()
 at.run()
-text_inputs(at, "First name")[0].input("Test")
-text_inputs(at, "Last name")[0].input("User")
-text_inputs(at, "Email")[0].input("test.user@example.com")
-text_inputs(at, "Username")[1].input("testuser")       # [0] is the login tab's
-text_inputs(at, "Password")[1].input("Test@1234")      # [0] is the login tab's
-text_inputs(at, "Repeat password")[0].input("Test@1234")
-find_button(at, "Register").click()
-at.run()
-check("registration succeeds", any("created" in s.value for s in at.success),
+do_register(at, "Test", "User", "test.user@example.com", "testuser", "Test@1234")
+check("registration auto-logs the new account in",
+      session_get(at, "authentication_status") is True
+      and session_get(at, "username") == "testuser",
       "; ".join(e.value for e in at.error))
+check("welcome message + onboarding shown right after registering",
+      any("signed in as" in (s.value or "") for s in at.success)
+      and has_button(at, "Skip for now"), all_text(at)[:300])
 users = db.load_credentials()["usernames"]
 check("new account persisted to SQLite", "testuser" in users)
 check("password stored as working bcrypt hash",
       bcrypt.checkpw(b"Test@1234", users["testuser"]["password"].encode()))
 
-text_inputs(at, "First name")[0].input("Test")
-text_inputs(at, "Last name")[0].input("User")
-text_inputs(at, "Email")[0].input("other@example.com")
-text_inputs(at, "Username")[1].input("testuser")
-text_inputs(at, "Password")[1].input("Test@1234")
-text_inputs(at, "Repeat password")[0].input("Test@1234")
-find_button(at, "Register").click()
+# The registering session is now logged in, so duplicate/weak attempts need a
+# fresh hub. Both fail, so they can share one session (the hub stays up).
+at = fresh_app()
 at.run()
+do_register(at, "Test", "User", "other@example.com", "testuser", "Test@1234")
 check("duplicate username rejected with an error", len(at.error) > 0)
 
-text_inputs(at, "First name")[0].input("Weak")
-text_inputs(at, "Last name")[0].input("Pass")
-text_inputs(at, "Email")[0].input("weak@example.com")
-text_inputs(at, "Username")[1].input("weakuser")
-text_inputs(at, "Password")[1].input("abc")
-text_inputs(at, "Repeat password")[0].input("abc")
-find_button(at, "Register").click()
-at.run()
+do_register(at, "Weak", "Pass", "weak@example.com", "weakuser", "abc")
 check("weak password rejected with an error", len(at.error) > 0)
 check("weak-password account NOT persisted",
       "weakuser" not in db.load_credentials()["usernames"])
+
+# --- v6.3: usernames may be 1-3 words ("Lulu Man") ----------------------------
+at = fresh_app()
+at.run()
+do_register(at, "Lulu", "Man", "lulu.man@example.com", "Lulu Man", "Lulu@1234")
+check("two-word username registers and is auto-logged in",
+      session_get(at, "authentication_status") is True
+      and session_get(at, "username") == "lulu man",
+      "; ".join(e.value for e in at.error))
+check("two-word account stored lowercased in SQLite (library lowercases)",
+      "lulu man" in db.load_credentials()["usernames"])
+
+at = fresh_app()
+at.run()
+do_login(at, "Lulu Man", "Lulu@1234")   # login lowercases the typed username too
+check("two-word account can log in from a fresh session",
+      session_get(at, "authentication_status") is True)
+
+at = fresh_app()
+at.run()
+do_register(at, "Four", "Words", "four.words@example.com",
+            "one two three four", "Four@1234")
+check("four-word username rejected with an error", len(at.error) > 0)
+check("four-word account NOT persisted",
+      "one two three four" not in db.load_credentials()["usernames"])
 
 # ------------------------------------------- 6: onboarding for new registrations
 print("6. Onboarding: shown once for new accounts, skippable, saves a profile")
@@ -436,18 +472,6 @@ check("form prefilled right after onboarding",
 # ------------- 6b: v6.1 regressions — new accounts start with a clean form
 print("6b. Stale-form fix, pending-save contract, logout wipe")
 
-
-def do_register(at, first, last, email, username, password):
-    text_inputs(at, "First name")[0].input(first)
-    text_inputs(at, "Last name")[0].input(last)
-    text_inputs(at, "Email")[0].input(email)
-    text_inputs(at, "Username")[1].input(username)
-    text_inputs(at, "Password")[1].input(password)
-    text_inputs(at, "Repeat password")[0].input(password)
-    find_button(at, "Register").click()
-    at.run()
-
-
 # (i) guest inputs survive one form-less run (Streamlit drops widget state
 # only after a full absent run), so a guest who goes straight to the login
 # form would leak their inputs into the next account — the fresh-login reset
@@ -482,8 +506,8 @@ at.run()
 find_button(at, "Log in / Register").click()
 at.run()
 do_register(at, "Stale", "User", "stale@example.com", "staleuser", "Stale@1234")
-do_login(at, "staleuser", "Stale@1234")
-check("onboarding shown for the new account", has_button(at, "Skip for now"))
+check("onboarding shown right after registering (auto-login)",
+      has_button(at, "Skip for now"))
 find_button(at, "Skip for now").click()
 at.run()
 check("skipping onboarding lands on a CLEAN form (no leftovers, 0 years)",
@@ -506,7 +530,6 @@ saved_point = session_get(at, "last_result")["point"]
 find_button(at, "Log in / Register to save").click()
 at.run()
 do_register(at, "Save", "User", "save@example.com", "saveuser", "Save@1234")
-do_login(at, "saveuser", "Save@1234")
 find_button(at, "Skip for now").click()
 at.run()
 saved_rows = db.list_predictions("saveuser")
@@ -686,7 +709,7 @@ check("one-line takeaway names the driving concepts",
 n_images = len(at.get("image"))
 check("range chart + experience curves rendered", n_images >= 2,
       f"images rendered = {n_images}")
-check("re-evaluation caption shown", "current model" in whatif_text)
+check("re-evaluation caveat removed (v6.3)", "current model" not in whatif_text)
 print("       takeaway: " + next((i.value for i in at.info if "Scenario" in (i.value or "")
                                   or "almost the same" in (i.value or "")), "(none)"))
 

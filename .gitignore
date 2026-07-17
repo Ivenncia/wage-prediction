@@ -1,6 +1,5 @@
 # Data and trained model artifacts (too large / regenerable — never commit)
 data/
-models/*.joblib
 
 # Secrets — SMTP credentials for the forgot-password email
 .streamlit/secrets.toml
