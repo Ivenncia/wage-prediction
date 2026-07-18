@@ -1065,15 +1065,31 @@ check("reopening the section shows empty fields",
       list(password_fields(at).values()) == ["", "", ""],
       str(password_fields(at)))
 
+# v7.3 regression: log out while the Change-password section is OPEN. The
+# library applies logout MID-run, after the password widgets were instantiated,
+# and Streamlit forbids ASSIGNING session state to instantiated widget keys —
+# v7.2's logout wipe did exactly that and crashed the deployed app with
+# StreamlitAPIException. The section must stay open during the click run to
+# reproduce the browser condition (AppTest drops expander state between runs,
+# which is how the original suite missed it).
+at.text_input(key="pw_current").input("typed-before-logout")
+at.session_state["pw_expander"] = True   # keep the section open, browser-style
 find_button(at, "Logout").click()
 at.run()
+check("logout with the password section open raises no exception (v7.3)",
+      not at.exception,
+      "; ".join(e.message for e in at.exception))
 at.run()   # the library applies its logout mid-run; settle once
-check("logout after using the password form is clean",
+check("logout after using the password form lands on the hub",
       has_button(at, "Continue as guest") and not at.exception, str(at.exception))
 at = fresh_app()
 at.run()
 do_login(at, "supervisor", "Sup3r@New1")
 check("the new password logs the account in",
       at.session_state["authentication_status"] is True)
+run_with_password_section_open(at)
+check("password fields are empty for the next login (no logout wipe needed)",
+      list(password_fields(at).values()) == ["", "", ""],
+      str(password_fields(at)))
 
 print(f"\nAll {len(PASSED)} checks passed.")

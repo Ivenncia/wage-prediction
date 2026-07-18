@@ -257,17 +257,21 @@ def clear_result_on_logout(_callback_info=None):
     """Wipe everything personal on logout — the unsaved prediction, the
     profile-prefill flag, the navigation position and all form/editor inputs —
     so the next visitor on this browser tab starts from a clean app, not the
-    previous user's data."""
-    keys = (["last_result", "profile_applied", "nav", "whatif_pick"]
+    previous user's data.
+
+    ONLY pops in here, never assignments. Unlike every other callback in this
+    app, the library invokes this one MID-run (its logout is an `if st.button`
+    check, not an on_click), after the change-password widgets were already
+    created in the run whenever that section is open — and Streamlit raises
+    StreamlitAPIException on ASSIGNING to an already-instantiated widget key
+    (popping is exempt). v7.2 called clear_password_fields() here and crashed
+    the deployed app's logout exactly that way. The password fields need no
+    logout wipe anyway: opening the user menu or the section fires their
+    on_change clearing first, so the next visitor always sees empty fields."""
+    keys = (["last_result", "profile_applied", "nav", "whatif_pick", "pw_message"]
             + FORM_WIDGET_KEYS + ONBOARD_WIDGET_KEYS + PROFILE_WIDGET_KEYS)
     for key in keys:
         st.session_state.pop(key, None)
-    # The password fields are ASSIGNED empty rather than popped: the user menu
-    # is still on screen during the logout run (the library applies its logout
-    # mid-run), and popping keys out from under rendered widgets caused the v2
-    # "ghost widget" crash. Assignment is safe there and also tells the
-    # browser to drop whatever was typed.
-    clear_password_fields()
 
 
 def submit_password_change(user):

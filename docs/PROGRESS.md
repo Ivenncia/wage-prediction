@@ -1258,3 +1258,77 @@ could), so a half-typed password no longer survives logout.
   eye icons, checkbox under the fields, and that after a successful change +
   collapse/reopen the fields are finally EMPTY in the browser; (5) re-screenshot the
   user-menu and forgot-password figures for the report.
+
+---
+
+## Dashboard v7.3: logout crash fix (StreamlitAPIException on the deployed app) (2026-07-18)
+
+Files: dashboards/app.py (clear_result_on_logout only), scripts/test_dashboard.py
+(suite 148 → 150), docs/PROGRESS.md. Nothing else changed.
+
+### (a) Symptom
+On the deployed app (v7.2), clicking **Logout** while the "Change password" section
+was open crashed the whole page with `streamlit.errors.StreamlitAPIException`
+(student's screenshot: traceback through `authenticator.logout(...)` → library
+callback → our `clear_result_on_logout`).
+
+### (b) Root cause
+Three facts combined:
+1. streamlit-authenticator applies logout **mid-run** (an `if st.button` check, not
+   an on_click callback — documented here since v6.1). So `clear_result_on_logout`
+   executes in the MIDDLE of a script run, unlike every other callback in the app.
+2. At that point the change-password widgets are already instantiated in the same run
+   whenever the section is open — they render above the Logout button in the popover.
+3. v7.2 made `clear_result_on_logout` call `clear_password_fields()`, which ASSIGNS
+   `st.session_state["pw_current"] = ""` etc. Streamlit's session state forbids
+   assigning to a key whose widget was already instantiated this run
+   (`session_state.py` `__setitem__`: "`st.session_state.<key>` cannot be modified
+   after the widget with key `<key>` is instantiated."). Reproduced verbatim.
+   Crucially, `__delitem__` has NO such guard — which is why the POPs in the same
+   callback (form/onboard/profile keys) have always been safe, and why logout never
+   crashed before v7.2 added the one assignment path.
+
+The crash needs the section OPEN at logout time (otherwise the widgets are not
+instantiated and assignment is legal) — exactly the student's screenshot state.
+
+### (c) Why the 148-check suite missed it
+AppTest does not persist an expander's open state between runs (the very reason the
+suite's `run_with_password_section_open()` helper re-asserts it before every run).
+In the v7.2 logout test the section had auto-collapsed by the click run, so the
+fields were never instantiated and the assignments were legal. A real browser keeps
+the expander open — fields instantiated — crash. The new regression test closes this
+gap by re-asserting `pw_expander = True` in the same run batch as the Logout click;
+against the v7.2 code it reproduces the exact StreamlitAPIException (verified before
+fixing), against the fixed code it passes.
+
+### (d) Fix
+`clear_result_on_logout` no longer calls `clear_password_fields()`; `pw_message`
+returned to its popped-keys list; docstring now states the rule (only pops in this
+callback, never assignments, because it runs mid-run). No privacy regression: the
+password fields cannot leak to the next visitor because `clear_password_fields`
+still fires as the on_change of BOTH the user-menu popover and the expander — real
+pre-run callbacks — so opening the menu or the section always clears the fields
+before they render; widget-owned leftovers are additionally dropped by Streamlit's
+own GC during the hub runs. `clear_password_fields` keeps exactly three callers,
+all pre-run: popover on_change, expander on_change, submit_password_change.
+
+### (e) Verification
+- Reproduction first: standalone probe (section open during the logout click run)
+  raised `StreamlitAPIException: st.session_state.pw_current cannot be modified
+  after the widget with key pw_current is instantiated` against the v7.2 code;
+  zero exceptions after the fix.
+- scripts/test_dashboard.py: **150/150 checks pass** (was 148). New: logout with the
+  password section open raises no exception; password fields are empty on the next
+  login (proves the logout wipe was unnecessary).
+- Headless boot: /healthz 200, / 200, boot log clean.
+- STUDENT: commit + push, let Streamlit Cloud redeploy, then on the live app: log
+  in, open Change password, click Logout — must land on the entry hub with no error
+  page. (This is the same push that carries v7.2, so run the DEPLOYMENT.md ALTER
+  TABLE and the [app] url Cloud secret first if not done yet.)
+
+### (f) Lesson recorded for the report
+Streamlit session-state writes are only legal for widgets not yet instantiated in
+the current run; the one library callback that runs mid-run (logout) therefore must
+never assign widget state. The set/del asymmetry (assign guarded, pop exempt) is
+why the bug hid behind otherwise-identical cleanup code, and the AppTest/browser
+difference in expander-state persistence is why the suite could not see it.
