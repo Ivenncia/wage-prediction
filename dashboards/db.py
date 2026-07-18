@@ -127,6 +127,31 @@ def update_password(username, password_hash):
      .eq("username", username).execute())
 
 
+def set_reset_token(username, token_hash, expires_epoch):
+    """Store a forgot-password reset request: the SHA-256 hash of the emailed
+    token (never the token itself) and the unix time the link stops working.
+    One request per user — a newer link replaces any older one."""
+    (_client().table("users")
+     .update({"reset_token_hash": token_hash, "reset_token_expires": expires_epoch})
+     .eq("username", username).execute())
+
+
+def get_reset_request(token_hash):
+    """The user a reset-token hash belongs to, as {'username', 'reset_token_expires'},
+    or None when no account carries this hash (unknown or already-used token).
+    Expiry is checked by the caller, so 'expired' can share the same message."""
+    rows = (_client().table("users").select("username, reset_token_expires")
+            .eq("reset_token_hash", token_hash).execute().data)
+    return rows[0] if rows else None
+
+
+def clear_reset_token(username):
+    """Invalidate the user's reset link (called the moment it is used)."""
+    (_client().table("users")
+     .update({"reset_token_hash": None, "reset_token_expires": None})
+     .eq("username", username).execute())
+
+
 # -------------------------------------------------------------- predictions
 def save_prediction(username, record):
     """Save one prediction for a logged-in user. Returns the new row id

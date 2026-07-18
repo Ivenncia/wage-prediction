@@ -18,11 +18,16 @@ Profile / About the model) with a user menu in the top-right corner. The
 prediction form lives in the sidebar of the Predict page only, grouped into
 sections; form values survive page switches through the session-state
 keep-alive below. Styling comes from native Streamlit theming
-(.streamlit/config.toml) and bordered containers only — no custom HTML/CSS.
+(.streamlit/config.toml) and bordered containers; the single CSS override in
+the app hides the built-in reveal eye on the password forms (student-approved
+exception — they have their own "Show passwords" checkbox).
 """
 
+import hashlib
 import re
+import secrets
 import sys
+import time
 from pathlib import Path
 
 import joblib
@@ -61,6 +66,17 @@ ARTIFACT_FILES = {
 }
 
 st.set_page_config(page_title="Malaysia Wage Predictor", page_icon="💼", layout="centered")
+
+# The app's ONE style override (student-approved exception to the no-custom-CSS
+# rule): Streamlit always draws a reveal eye inside password inputs, but the
+# two password forms here have their own "Show passwords" checkbox, so the
+# built-in eye is hidden. Scoped to the two keyed containers that hold password
+# fields — no other widget is affected.
+st.html("<style>"
+        ".st-key-pw_fields div[data-testid='stTextInputRootElement'] button,"
+        ".st-key-reset_fields div[data-testid='stTextInputRootElement'] button"
+        "{display:none;}"
+        "</style>")
 
 # Chart styling: an accessible, colorblind-safe diverging pair (blue = raises,
 # red = lowers) plus recessive grey chrome, so the data is the loudest thing.
@@ -173,13 +189,42 @@ class MultiWordUsernameValidator(stauth.Validator):
                              username))
 
 
+# One shared validator instance: the Authenticate widget uses it for
+# registration, and the forgot-password / reset-link forms call its
+# validate_email / validate_password / diagnose_password directly, so every
+# entry point enforces the identical rules.
+validator = MultiWordUsernameValidator()
+
 authenticator = stauth.Authenticate(
     credentials,
     config["cookie"]["name"],
     cookie_key,
     config["cookie"]["expiry_days"],
-    validator=MultiWordUsernameValidator(),
+    validator=validator,
 )
+
+# ---------------------------------------------------- password-reset settings
+# The emailed reset link must point back at THIS app. The address cannot be
+# discovered from inside a request, so it lives in secrets: localhost while
+# developing, the *.streamlit.app address once deployed.
+try:
+    APP_URL = st.secrets["app"]["url"].rstrip("/")
+except (KeyError, FileNotFoundError):
+    APP_URL = "http://localhost:8501"
+
+RESET_LINK_TTL_SECONDS = 30 * 60   # a reset link dies 30 minutes after it is requested
+
+
+def hash_reset_token(token):
+    """Reset tokens are stored as SHA-256 hashes: someone who can read the
+    database still cannot reconstruct a working reset link from a stored row."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+# The password rules shown next to the "New password" field. Read from the
+# library rather than retyped here, so the help text can never drift away from
+# the rule the library actually enforces.
+PASSWORD_HELP = authenticator.attrs.get("password_instructions",
+                                        stauth.params.PASSWORD_INSTRUCTIONS)
 
 
 # Every prediction-form widget key: the keep-alive loop below preserves these
@@ -190,6 +235,22 @@ FORM_WIDGET_KEYS = ["job_title_input", "category_input", "state_input", "type_in
 # seeded from the database, so they only need wiping on logout.
 ONBOARD_WIDGET_KEYS = ["onboard_edu", "onboard_state", "onboard_exp", "onboard_skills"]
 PROFILE_WIDGET_KEYS = ["profile_edu", "profile_state", "profile_exp", "profile_skills"]
+def clear_password_fields():
+    """Empty the change-password form. Runs whenever the user menu or the
+    'Change password' section is opened or closed, so half-typed passwords are
+    never left sitting in the form waiting to be reopened.
+
+    The keys are ASSIGNED empty values, never popped. Popping only deletes the
+    server-side copy — the browser's widget manager still remembers the typed
+    text for those widgets and re-reports it on the next sync, which is exactly
+    the "old input reappears" bug v7.1 shipped with. Assigning marks each key
+    app-owned and pushes the empty value down to the browser (Streamlit's
+    documented way to clear an input from a callback)."""
+    st.session_state["pw_current"] = ""
+    st.session_state["pw_new"] = ""
+    st.session_state["pw_repeat"] = ""
+    st.session_state["pw_show"] = False
+    st.session_state.pop("pw_message", None)
 
 
 def clear_result_on_logout(_callback_info=None):
@@ -201,6 +262,81 @@ def clear_result_on_logout(_callback_info=None):
             + FORM_WIDGET_KEYS + ONBOARD_WIDGET_KEYS + PROFILE_WIDGET_KEYS)
     for key in keys:
         st.session_state.pop(key, None)
+    # The password fields are ASSIGNED empty rather than popped: the user menu
+    # is still on screen during the logout run (the library applies its logout
+    # mid-run), and popping keys out from under rendered widgets caused the v2
+    # "ghost widget" crash. Assignment is safe there and also tells the
+    # browser to drop whatever was typed.
+    clear_password_fields()
+
+
+def submit_password_change(user):
+    """Verify the current password, set the new one, then clear the form.
+
+    This runs as a button callback, i.e. BEFORE the next script run — the only
+    moment at which Streamlit allows a widget's key to be removed from session
+    state. It is the same callback-not-st.rerun() pattern used everywhere else
+    in this app.
+
+    All of the actual checking is still done by streamlit-authenticator: its
+    controller confirms the new password is non-empty, that both copies match,
+    that it differs from the current one, that it meets the password policy,
+    and that the current password verifies against the stored bcrypt hash. On
+    success it updates the in-memory credentials dict, which we then persist.
+    """
+    try:
+        authenticator.authentication_controller.reset_password(
+            user,
+            st.session_state.get("pw_current", ""),
+            st.session_state.get("pw_new", ""),
+            st.session_state.get("pw_repeat", ""),
+        )
+    except Exception as exc:   # wrong current password, weak new one, mismatch, ...
+        # Keep whatever was typed: usually only one field needs correcting.
+        st.session_state["pw_message"] = ("error", str(exc))
+        return
+    db.update_password(user, credentials["usernames"][user]["password"])
+    clear_password_fields()   # assigns "" — the browser really clears (v7.2 fix)
+    st.session_state["pw_message"] = ("success", "Password changed.")
+
+
+def leave_reset_page():
+    """'Back to log in' on a dead reset link: drop the token from the URL so
+    the next run shows the normal entry hub."""
+    st.query_params.clear()
+
+
+def submit_password_reset(reset_username):
+    """Set a new password from the emailed reset link, then sign the user in.
+
+    The link already proved control of the account's email address, so no
+    current password is asked for. The new password passes the same policy as
+    registration; the token is single-use (cleared the moment it is spent)."""
+    new = st.session_state.get("rp_new", "")
+    repeat = st.session_state.get("rp_repeat", "")
+    if not new:
+        st.session_state["rp_message"] = ("error", "Please enter a new password.")
+        return
+    if new != repeat:
+        st.session_state["rp_message"] = ("error", "Passwords do not match.")
+        return
+    if not validator.validate_password(new):
+        st.session_state["rp_message"] = ("error", validator.diagnose_password(new))
+        return
+    new_hash = stauth.Hasher.hash(new)
+    db.update_password(reset_username, new_hash)
+    db.clear_reset_token(reset_username)   # single use — the link dies here
+    credentials["usernames"][reset_username]["password"] = new_hash
+    # Sign the user straight in: the token path is the library's own
+    # cookie-restore mechanism (the same pattern as auto-login after
+    # registration, v6.3), and set_cookie keeps the session across a refresh.
+    authenticator.authentication_controller.login(token={"username": reset_username})
+    authenticator.cookie_controller.set_cookie()
+    st.session_state["just_reset"] = True
+    st.session_state["rp_new"] = ""
+    st.session_state["rp_repeat"] = ""
+    st.session_state["rp_show"] = False
+    st.query_params.clear()
 
 
 # Button callbacks run BEFORE the next script run, so the flag is already set
@@ -268,6 +404,44 @@ def save_profile_from_page(username_to_save):
     st.session_state["profile_saved"] = True
 
 
+# ------------------------------------------- password-reset landing page
+# Reached from the emailed link (…?reset_token=…). It renders INSTEAD of the
+# entry hub for visitors who are not signed in; a successful reset signs the
+# user straight in through the submit callback, which also clears the token
+# from the URL — so the next run falls through to the app below.
+reset_token_param = st.query_params.get("reset_token")
+if reset_token_param and not st.session_state.get("authentication_status"):
+    st.title("💼 Malaysia Wage Predictor")
+    st.subheader("Set a new password")
+    reset_request = db.get_reset_request(hash_reset_token(reset_token_param))
+    reset_expired = (bool(reset_request)
+                     and time.time() > (reset_request.get("reset_token_expires") or 0))
+    if reset_request is None or reset_expired:
+        # Same message for unknown and expired tokens: an attacker probing
+        # random tokens learns nothing about which ones once existed.
+        st.error("This reset link is invalid or has expired. You can request "
+                 "a new one from the 'Forgot password' tab on the log-in page.")
+        st.button("Back to log in", on_click=leave_reset_page)
+    else:
+        st.write("Choose a new password for your account. You will be signed "
+                 "in right after.")
+        # Same reveal pattern as the change-password form: the checkbox below
+        # the fields drives the masking, read from session state BEFORE the
+        # inputs render (its click reruns the app first).
+        rp_type = "default" if st.session_state.get("rp_show", False) else "password"
+        with st.container(key="reset_fields"):
+            st.text_input("New password", type=rp_type, key="rp_new",
+                          help=PASSWORD_HELP, autocomplete="off")
+            st.text_input("Repeat new password", type=rp_type, key="rp_repeat",
+                          autocomplete="off")
+        st.checkbox("Show passwords", key="rp_show")
+        st.button("Set new password and sign in", type="primary",
+                  on_click=submit_password_reset, args=(reset_request["username"],))
+        rp_kind, rp_text = st.session_state.pop("rp_message", (None, None))
+        if rp_kind == "error":
+            st.error(rp_text)
+    st.stop()
+
 # ------------------------------------------------------- entry screen (hub)
 # Three ways in: log in, register a new account, or continue as a guest.
 # Nothing else renders until one of them happened. The hub lives inside an
@@ -310,28 +484,39 @@ if not st.session_state.get("guest_mode") and not st.session_state.get("authenti
                 st.error(str(exc))
 
         with tab_forgot:
-            st.caption("Enter your username and a new password will be sent to "
-                       "the email address you registered with.")
-            try:
-                fp_username, fp_email, fp_new_password = authenticator.forgot_password(
-                    location="main")
-                if fp_username:
-                    # The widget already replaced the hash in the credentials dict —
-                    # persist it, then deliver the new password to the user.
-                    db.update_password(fp_username,
-                                       credentials["usernames"][fp_username]["password"])
-                    if emailer.send_password_email(fp_email, fp_username, fp_new_password):
-                        st.success(f"A new password has been emailed to **{fp_email}**.")
+            st.caption("Enter your account's email address and we will send "
+                       "you a link to set a new password.")
+            fp_email = st.text_input("Email", key="fp_email")
+            if st.button("Send reset link", key="fp_send"):
+                entered_email = fp_email.strip().lower()
+                # Emails are unique in the users table, so at most one account
+                # matches. The credentials dict is reloaded on every run, so
+                # this needs no extra database call.
+                fp_username = next(
+                    (u for u, info in credentials["usernames"].items()
+                     if (info.get("email") or "").strip().lower() == entered_email),
+                    None)
+                if not validator.validate_email(entered_email):
+                    st.error("That does not look like a valid email address.")
+                elif fp_username is None:
+                    st.error("No account uses this email address.")
+                else:
+                    # The link carries a random single-use token; only its
+                    # SHA-256 hash is stored, with a 30-minute expiry.
+                    reset_token = secrets.token_urlsafe(32)
+                    db.set_reset_token(fp_username, hash_reset_token(reset_token),
+                                       int(time.time()) + RESET_LINK_TTL_SECONDS)
+                    reset_link = f"{APP_URL}/?reset_token={reset_token}"
+                    if emailer.send_reset_link_email(entered_email, fp_username,
+                                                     reset_link):
+                        st.success(f"A reset link has been emailed to "
+                                   f"**{entered_email}**. It expires in 30 minutes.")
                     else:
-                        st.warning("The password email could not be sent (SMTP not "
-                                   "configured or unreachable), so the new password is "
-                                   "shown below instead. Log in with it and change it "
-                                   "right away.")
-                        st.code(fp_new_password)
-                elif fp_username is False:
-                    st.error("Username not found.")
-            except Exception as exc:  # ForgotError and any SMTP surprises
-                st.error(str(exc))
+                        st.warning("The reset email could not be sent (SMTP not "
+                                   "configured or unreachable), so the link is "
+                                   "shown below instead. Open it to set a new "
+                                   "password.")
+                        st.code(reset_link)
 
         st.divider()
         st.button("Continue as guest", on_click=enter_guest_mode,
@@ -364,19 +549,60 @@ with col_title:
     st.title("💼 Malaysia Wage Predictor")
 with col_user:
     if logged_in:
-        with st.popover(display_name, width="stretch"):
+        # Giving the menu and the section a key plus an on_change callback is
+        # what makes collapsing them run the app again — without it Streamlit
+        # opens and closes these containers purely in the browser, and the
+        # password fields could never be cleared on close.
+        with st.popover(display_name, width="stretch", key="user_menu",
+                        on_change=clear_password_fields):
             st.markdown(f"Signed in as **{display_name}**")
             st.caption(f"Username: {username}")
-            with st.expander("Change password"):
-                try:
-                    if authenticator.reset_password(username, location="main"):
-                        # The widget verified the old password and updated the
-                        # credentials dict — persist the new hash
-                        db.update_password(
-                            username, credentials["usernames"][username]["password"])
-                        st.success("Password changed.")
-                except Exception as exc:  # wrong current password, weak new one, ...
-                    st.error(str(exc))
+            password_section = st.expander("Change password", key="pw_expander",
+                                           on_change=clear_password_fields)
+            with password_section:
+                # The fields exist only while the section is open. Together
+                # with the on_change callback above this is what empties the
+                # form when the user closes it: the inputs are not rendered on
+                # the next run, so Streamlit drops their state and reopening
+                # the section always starts from blank fields.
+                if password_section.open:
+                    # This form deliberately does NOT use the library's
+                    # reset_password() widget. That widget puts its three
+                    # inputs in an st.form with no keys, so their values are
+                    # unreachable from session state: they survive a
+                    # successful change and reappear when the section is
+                    # reopened. Owning the keys here fixes that, and lets one
+                    # checkbox drive the masking of all three fields.
+                    # Plain widgets rather than st.form, because a widget
+                    # inside a form does not take effect until the form is
+                    # submitted — the same reason the prediction form dropped
+                    # st.form in v2.
+                    # The "Show passwords" checkbox sits BELOW the fields, so
+                    # its value is read from session state before they render
+                    # (clicking it reruns the app, and by then the new value
+                    # is already there). autocomplete="off" keeps the browser
+                    # password manager from refilling the cleared fields. The
+                    # container key scopes the CSS that hides the built-in
+                    # reveal eye (the checkbox is the working reveal here).
+                    show = st.session_state.get("pw_show", False)
+                    field_type = "default" if show else "password"
+                    with st.container(key="pw_fields"):
+                        st.text_input("Current password", type=field_type,
+                                      key="pw_current", autocomplete="off")
+                        st.text_input("New password", type=field_type, key="pw_new",
+                                      help=PASSWORD_HELP, autocomplete="off")
+                        st.text_input("Repeat new password", type=field_type,
+                                      key="pw_repeat", autocomplete="off")
+                    st.checkbox("Show passwords", key="pw_show")
+                    st.button("Change password", key="pw_submit",
+                              on_click=submit_password_change, args=(username,))
+                    # Popped, not read: the message belongs to the click that
+                    # produced it and should not linger on the next interaction.
+                    kind, message = st.session_state.pop("pw_message", (None, None))
+                    if kind == "success":
+                        st.success(message)
+                    elif kind == "error":
+                        st.error(message)
             authenticator.logout("Logout", "main", callback=clear_result_on_logout)
     else:
         with st.popover("Guest", width="stretch"):
@@ -388,6 +614,11 @@ with col_user:
 # here in the app body instead — above the onboarding card a new account sees.
 if logged_in and st.session_state.pop("just_registered", False):
     st.success(f"Account created — you are signed in as **{display_name}**.")
+
+# Same idea after a reset-link password change: the reset page is gone by the
+# time this run renders, so the confirmation shows here in the app body.
+if logged_in and st.session_state.pop("just_reset", False):
+    st.success(f"Password changed — you are signed in as **{display_name}**.")
 
 
 # ---------------------------------------------------------- artifact loading

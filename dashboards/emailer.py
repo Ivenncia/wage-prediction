@@ -4,8 +4,8 @@ streamlit-authenticator 0.4.x can only send emails through the library author's
 cloud service (it needs a paid `api_key`), so the email is sent here instead
 with smtplib. SMTP settings live in `.streamlit/secrets.toml` (git-ignored) —
 credentials never appear in code. When SMTP is not configured or sending
-fails, functions return False and the app falls back to showing the new
-password on screen, so the demo works without any email setup.
+fails, functions return False and the app falls back to showing the reset
+link on screen, so the demo works without any email setup.
 """
 
 import smtplib
@@ -33,32 +33,31 @@ def smtp_configured():
     return _smtp_settings() is not None
 
 
-def send_password_email(to_email, username, new_password):
-    """Email the newly generated password to the user.
+def send_reset_link_email(to_email, username, reset_link):
+    """Email a password-reset link to the user.
 
     Returns True on success, False on any failure — the caller then shows
-    the password on screen instead, so forgot-password can never dead-end.
+    the link on screen instead, so forgot-password can never dead-end.
     """
     smtp = _smtp_settings()
     if smtp is None:
         return False
 
     message = EmailMessage()
-    message["Subject"] = "Malaysia Wage Predictor — your new password"
+    message["Subject"] = "Malaysia Wage Predictor — reset your password"
     message["From"] = smtp["user"]
     message["To"] = to_email
     message.set_content(
         f"Hello {username},\n"
         f"\n"
         f"A password reset was requested for your Malaysia Wage Predictor account.\n"
-        f"Your new password is:\n"
+        f"Open this link to create a new password:\n"
         f"\n"
-        f"    {new_password}\n"
+        f"    {reset_link}\n"
         f"\n"
-        f"Please log in with it and change it right away via 'Change password'\n"
-        f"in the sidebar.\n"
+        f"The link works once and expires in 30 minutes.\n"
         f"\n"
-        f"If you did not request this reset, you can ignore this email.\n"
+        f"If you did not request this reset, please ignore this email! \n"
     )
 
     try:

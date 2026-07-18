@@ -16,7 +16,9 @@ Known harness limits (verified manually in a browser instead):
 - real SMTP email delivery.
 """
 
+import hashlib
 import sys
+import time
 from pathlib import Path
 
 import bcrypt
@@ -30,7 +32,7 @@ import emailer
 # NEVER send real emails from tests — .streamlit/secrets.toml may hold real SMTP
 # credentials. Forcing False also exercises the on-screen fallback path
 # deterministically; real delivery is verified manually in a browser.
-emailer.send_password_email = lambda *args, **kwargs: False
+emailer.send_reset_link_email = lambda *args, **kwargs: False
 
 from streamlit.testing.v1 import AppTest
 
@@ -220,6 +222,36 @@ def all_text(at):
     return " | ".join(parts)
 
 
+def run_with_password_section_open(at):
+    """Run the app with the 'Change password' section expanded.
+
+    The section only renders its fields while it is open, and AppTest does not
+    carry an expander's open state from one run to the next (a browser does),
+    so the state is re-asserted before every run."""
+    at.session_state["pw_expander"] = True
+    at.run()
+    return at
+
+
+def password_fields(at):
+    """The three change-password inputs, by label -> current value.
+    Empty dict when the section is closed and the fields are not rendered."""
+    labels = ("Current password", "New password", "Repeat new password")
+    return {t.label: t.value for t in at.text_input if t.label in labels}
+
+
+def submit_password_change(at, current, new, repeat):
+    at.text_input(key="pw_current").input(current)
+    at.text_input(key="pw_new").input(new)
+    at.text_input(key="pw_repeat").input(repeat)
+    at.button(key="pw_submit").click()
+    return run_with_password_section_open(at)
+
+
+def stored_password_hash(user):
+    return [r for r in FAKE_DB.tables["users"] if r["username"] == user][0]["password_hash"]
+
+
 def do_login(at, user, password):
     text_inputs(at, "Username")[0].input(user)
     text_inputs(at, "Password")[0].input(password)
@@ -301,8 +333,11 @@ check("demo_user/demo123 accepted (test-seed hashes valid)",
       at.session_state["authentication_status"] is True)
 check("main app rendered after login (no onboarding for pre-seeded accounts)",
       has_button(at, "Predict my market salary"))
-check("user menu holds logout + change password",
-      has_button(at, "Logout") and bool(text_inputs(at, "Current password")))
+check("user menu holds logout + a change-password section",
+      has_button(at, "Logout")
+      and any(e.label == "Change password" for e in at.expander))
+check("change-password fields stay closed until the section is opened",
+      not text_inputs(at, "Current password"))
 check("top navigation shows the five pages",
       list(at.segmented_control(key="nav").options) == NAV_PAGES,
       str(list(at.segmented_control(key="nav").options)))
@@ -684,33 +719,112 @@ check("logout wiped the form for the next visitor",
       at.selectbox(key="job_title_input").value is None
       and session_get(at, "last_result") is None)
 
-# ------------------------- 7: forgot password (email send forced to fail)
-print("7. Forgot password with email delivery unavailable: on-screen fallback")
+# ------------------------- 7: forgot password = emailed reset link (v7.2)
+# The email send is forced to fail (see top of file), so the app must show
+# the reset link on screen — which also hands the test the token to open the
+# reset landing page with, via AppTest's query_params support.
+print("7. Forgot password: reset link, landing page, auto sign-in")
 old_hash = db.load_credentials()["usernames"]["testuser"]["password"]
 at = fresh_app()
 at.run()
-text_inputs(at, "Username")[2].input("testuser")       # [2] = the forgot tab's
-find_button(at, "Submit").click()
+text_inputs(at, "Email")[1].input("test.user@example.com")  # [0] = register tab's
+find_button(at, "Send reset link").click()
 at.run()
 check("fallback warning shown (email could not be sent)",
       any("could not be sent" in w.value for w in at.warning),
       "; ".join(e.value for e in at.error))
 codes = at.get("code")
-check("new password displayed on screen", len(codes) > 0)
-new_password = codes[0].value
+check("reset link displayed on screen", len(codes) > 0)
+reset_link = codes[0].value
+check("link points at the app with a reset_token parameter",
+      reset_link.startswith("http://localhost:8501/?reset_token="), reset_link)
+reset_token = reset_link.split("reset_token=", 1)[1]
+token_row = [r for r in FAKE_DB.tables["users"] if r["username"] == "testuser"][0]
+check("only the token's hash is stored, with an expiry in the future",
+      token_row.get("reset_token_hash") not in (None, reset_token)
+      and token_row.get("reset_token_expires", 0) > time.time())
+check("password hash untouched by requesting a link",
+      db.load_credentials()["usernames"]["testuser"]["password"] == old_hash)
+
+# Unknown email + invalid format -> explicit errors (student's decision)
+text_inputs(at, "Email")[1].input("nobody@example.com")
+find_button(at, "Send reset link").click()
+at.run()
+check("unknown email reported", any("No account uses" in e.value for e in at.error))
+text_inputs(at, "Email")[1].input("not-an-email")
+find_button(at, "Send reset link").click()
+at.run()
+check("invalid email format reported",
+      any("valid email" in e.value for e in at.error))
+
+# Open the reset link: weak password / mismatch rejected, then success
+at = fresh_app()
+at.query_params["reset_token"] = reset_token
+at.run()
+check("reset landing page renders instead of the hub",
+      has_button(at, "Set new password and sign in")
+      and not has_button(at, "Continue as guest"))
+
+at.text_input(key="rp_new").input("abc")
+at.text_input(key="rp_repeat").input("abc")
+find_button(at, "Set new password and sign in").click()
+at.query_params["reset_token"] = reset_token
+at.run()
+check("weak new password rejected on the reset page",
+      any("Password must" in e.value for e in at.error))
+
+at.text_input(key="rp_new").input("Res3t@Pass1")
+at.text_input(key="rp_repeat").input("Different@1")
+find_button(at, "Set new password and sign in").click()
+at.query_params["reset_token"] = reset_token
+at.run()
+check("mismatched passwords rejected on the reset page",
+      any("do not match" in e.value for e in at.error))
+
+at.text_input(key="rp_new").input("Res3t@Pass1")
+at.text_input(key="rp_repeat").input("Res3t@Pass1")
+find_button(at, "Set new password and sign in").click()
+at.query_params["reset_token"] = reset_token   # still in the URL when submitting
+at.run()
+check("successful reset signs the user straight in",
+      at.session_state["authentication_status"] is True
+      and at.session_state["username"] == "testuser")
+check("signed-in confirmation shown in the app body",
+      any("you are signed in" in s.value for s in at.success))
 new_hash = db.load_credentials()["usernames"]["testuser"]["password"]
-check("new hash persisted to the database", new_hash != old_hash)
-check("displayed password matches the stored hash",
-      bcrypt.checkpw(new_password.encode(), new_hash.encode()))
+check("new password persisted to the database",
+      bcrypt.checkpw(b"Res3t@Pass1", new_hash.encode()))
 check("old password no longer works",
       not bcrypt.checkpw(b"Test@1234", new_hash.encode()))
+token_row = [r for r in FAKE_DB.tables["users"] if r["username"] == "testuser"][0]
+check("token cleared after use (single use)",
+      token_row.get("reset_token_hash") is None
+      and token_row.get("reset_token_expires") is None)
 
+# A spent (or garbage) token and an expired token both show the dead-link card
+at = fresh_app()
+at.query_params["reset_token"] = reset_token
+at.run()
+check("reused link is rejected",
+      any("invalid or has expired" in e.value for e in at.error)
+      and not has_button(at, "Set new password and sign in"))
+
+expired_token = "expired-token-for-test"
+db.set_reset_token("testuser", hashlib.sha256(expired_token.encode()).hexdigest(),
+                   int(time.time()) - 60)   # expiry already in the past
+at = fresh_app()
+at.query_params["reset_token"] = expired_token
+at.run()
+check("expired link is rejected (same message as an invalid one)",
+      any("invalid or has expired" in e.value for e in at.error))
+db.clear_reset_token("testuser")
+
+# Fresh login with the new password still works through the normal hub
 at = fresh_app()
 at.run()
-text_inputs(at, "Username")[2].input("nobody_here")
-find_button(at, "Submit").click()
-at.run()
-check("unknown username reported", any("not found" in e.value for e in at.error))
+do_login(at, "testuser", "Res3t@Pass1")
+check("new password logs in through the hub",
+      at.session_state["authentication_status"] is True)
 
 # ------------------------------------------------- 8: history delete functions
 print("8. History delete/clear (db level; row selection UI needs a browser)")
@@ -853,5 +967,113 @@ check("save_profile keeps ONE row per user (upsert, not append)",
       len(FAKE_DB.tables["profiles"]) == len(
           {r["username"] for r in FAKE_DB.tables["profiles"]})
       and len(FAKE_DB.tables["profiles"]) >= 2)   # onboarder + demo_user saved above
+
+# --------------------------------------------- 13: change password (v7.1)
+# The form in the user menu is rendered by app.py, not by the library's
+# reset_password() widget, so that its inputs have keys and can be cleared.
+# All validation still goes through the library's authentication controller.
+# Runs last: it changes the supervisor account's password for good.
+print("13. Change password: reveal toggle, validation, clearing on success/close")
+at = fresh_app()
+at.run()
+do_login(at, "supervisor", "super123")
+run_with_password_section_open(at)
+check("opening the section renders three empty password fields",
+      list(password_fields(at).values()) == ["", "", ""],
+      str(password_fields(at)))
+check("fields are masked by default",
+      [t.proto.type for t in at.text_input if "password" in t.label.lower()] == [1, 1, 1])
+check("browser autofill disabled (autocomplete=off on all three fields)",
+      all(t.proto.autocomplete == "off" for t in at.text_input
+          if "password" in t.label.lower()))
+check("built-in reveal eye hidden by the scoped style block (v7.2)",
+      any(".st-key-pw_fields" in str(getattr(h, "value", "")
+                                     or getattr(h.proto, "body", ""))
+          for h in at.get("html")))
+
+
+def rendered_order(at, labels):
+    """(element type, label) pairs in render order, filtered to the given
+    labels — used to assert the on-screen ordering of widgets."""
+    def walk(block, out):
+        for child in getattr(block, "children", {}).values():
+            out.append((type(child).__name__, getattr(child, "label", None)))
+            walk(child, out)
+        return out
+    return [pair for pair in walk(at._tree, []) if pair[1] in labels]
+
+
+check("'Show passwords' sits below the inputs (v7.2 layout)",
+      rendered_order(at, ("Repeat new password", "Show passwords"))
+      == [("TextInput", "Repeat new password"), ("Checkbox", "Show passwords")],
+      str(rendered_order(at, ("Repeat new password", "Show passwords"))))
+
+at.checkbox(key="pw_show").set_value(True)
+run_with_password_section_open(at)
+check("'Show passwords' unmasks all three fields (type 0 = plain text)",
+      [t.proto.type for t in at.text_input if "password" in t.label.lower()] == [0, 0, 0])
+at.checkbox(key="pw_show").set_value(False)
+run_with_password_section_open(at)
+
+submit_password_change(at, "wrong_password", "Sup3r@New1", "Sup3r@New1")
+check("wrong current password rejected",
+      any("incorrect" in e.value for e in at.error))
+check("a rejected attempt keeps what was typed (only one field needs fixing)",
+      password_fields(at)["Current password"] == "wrong_password")
+check("a rejected attempt leaves the stored hash alone",
+      bcrypt.checkpw(b"super123", stored_password_hash("supervisor").encode()))
+
+submit_password_change(at, "super123", "Sup3r@New1", "Sup3r@New2")
+check("mismatched new passwords rejected",
+      any("do not match" in e.value for e in at.error))
+
+submit_password_change(at, "super123", "abc", "abc")
+check("weak new password rejected (library policy still applies)",
+      any("Password must" in e.value for e in at.error))
+
+submit_password_change(at, "super123", "Sup3r@New1", "Sup3r@New1")
+check("successful change confirmed on screen",
+      any("Password changed" in s.value for s in at.success))
+check("all three fields cleared after a successful change",
+      list(password_fields(at).values()) == ["", "", ""],
+      str(password_fields(at)))
+check("new password persisted to the database",
+      bcrypt.checkpw(b"Sup3r@New1", stored_password_hash("supervisor").encode()))
+check("old password no longer works",
+      not bcrypt.checkpw(b"super123", stored_password_hash("supervisor").encode()))
+run_with_password_section_open(at)
+check("the confirmation does not linger on the next interaction",
+      not any("Password changed" in s.value for s in at.success))
+
+# Closing the section: the fields stop rendering, so Streamlit drops their
+# state and reopening always starts blank. In a browser the expander's
+# on_change callback clears them as well; AppTest cannot click an expander
+# header, so the close is driven through its session state instead.
+at.text_input(key="pw_current").input("half_typed_secret")
+run_with_password_section_open(at)
+check("half-typed password is present before the section is closed",
+      password_fields(at)["Current password"] == "half_typed_secret")
+at.session_state["pw_expander"] = False
+at.run()
+check("closing the section stops rendering the fields", password_fields(at) == {})
+check("closing the section drops the password state",
+      not [k for k in at.session_state.filtered_state
+           if k.startswith("pw_") and k != "pw_expander"],
+      str([k for k in at.session_state.filtered_state if k.startswith("pw_")]))
+run_with_password_section_open(at)
+check("reopening the section shows empty fields",
+      list(password_fields(at).values()) == ["", "", ""],
+      str(password_fields(at)))
+
+find_button(at, "Logout").click()
+at.run()
+at.run()   # the library applies its logout mid-run; settle once
+check("logout after using the password form is clean",
+      has_button(at, "Continue as guest") and not at.exception, str(at.exception))
+at = fresh_app()
+at.run()
+do_login(at, "supervisor", "Sup3r@New1")
+check("the new password logs the account in",
+      at.session_state["authentication_status"] is True)
 
 print(f"\nAll {len(PASSED)} checks passed.")

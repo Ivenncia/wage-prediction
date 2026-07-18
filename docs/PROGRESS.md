@@ -1033,3 +1033,228 @@ streamlit-authenticator — Supabase is only the data store, not the auth system
   (3) the old demo accounts are gone — register your own accounts for the viva
   demo; (4) if the repo was ever public, consider the old cookie key compromised
   (already replaced) and never commit secrets.toml.
+
+---
+
+## Dashboard v7.1: change-password form rewritten — working reveal, fields that clear (2026-07-18)
+
+Files: dashboards/app.py (user-menu block + two new callbacks), scripts/test_dashboard.py
+(suite 113 → 133), docs/PROGRESS.md. No notebook, db.py, artifact or dependency changes.
+
+### (a) Purpose
+Two defects the student found in a browser: (1) the eye/reveal icon in the Change
+password fields does nothing when clicked; (2) the Current / New / Repeat inputs stay
+filled after a successful password change, and are still filled when the section is
+closed and reopened. Student decision: keep the existing layout (user menu popover →
+"Change password" section in the 26 % top-right column); fix the behaviour only.
+
+### (b) Root causes
+1. **Fields never cleared — confirmed in the library source.**
+   `authenticator.reset_password()` (streamlit-authenticator 0.4.2,
+   `views/authentication_view.py:527-591`) builds `st.form(key='Reset password',
+   clear_on_submit=False)` with a CONSTANT form key, and creates its three
+   `st.text_input`s with **no `key=`**. Their values therefore live under
+   auto-generated widget IDs that never change and are unreachable from
+   `st.session_state` — this app's `st.session_state.pop(key, None)` convention
+   (`clear_result_on_logout`) structurally could not touch them. The success path
+   (`models/authentication_model.py:585-615`) clears nothing either.
+   Compounding it: the popover and the expander had no `key`, so collapsing them
+   ran no Python at all — nothing could react to the section being closed.
+2. **Eye icon — root cause NOT found.** In Streamlit 1.59.2 the reveal button is
+   rendered unconditionally for every `type="password"` input and is pure client-side
+   React state (`static/js/TextInput.C78pm77f.js`: `[z,B]=useState(!1)`,
+   `ie=()=>B(e=>!e)`, input type `z?'text':...`), so no server-side code can break it
+   and toggling it triggers no rerun. Nothing in the authenticator or in Streamlit
+   suppresses it. Rather than guess at a frontend cause, the reveal was replaced with
+   a control the app owns.
+
+### (c) What changed (dashboards/app.py)
+1. **The library's `reset_password()` view is no longer used** — only its
+   `authentication_controller.reset_password(...)`, which does ALL the checking
+   exactly as before: new password non-empty, both copies match, different from the
+   current one, meets the password policy, and the current password verifies against
+   the stored bcrypt hash. Security semantics are unchanged; only the presentation
+   layer is now ours.
+2. **Own widgets, own keys**: `pw_show` (checkbox), `pw_current` / `pw_new` /
+   `pw_repeat` (text inputs), `pw_submit` (button), collected in
+   `PASSWORD_WIDGET_KEYS`. Plain widgets, NOT `st.form` — a widget inside a form does
+   not take effect until submit, and the reveal checkbox has to work immediately (the
+   same reason the prediction form dropped `st.form` in v2).
+3. **Reveal**: one "Show passwords" checkbox drives `type="default"` vs
+   `type="password"` on all three fields. Server-side state, so it works by
+   construction.
+4. **`submit_password_change(user)`** — a button `on_click` callback (callbacks run
+   before the next script run, the only moment Streamlit allows widget keys to be
+   removed). Success → persist the hash via `db.update_password`, set
+   `pw_message=("success", ...)`, pop all three fields. Failure → set
+   `pw_message=("error", str(exc))` and KEEP the typed values, so only the wrong
+   field needs retyping. The message is `pop`ped when rendered, so it does not linger
+   into the next interaction.
+5. **Clearing on close** — two independent mechanisms:
+   - the popover and expander now take `key="user_menu"` / `key="pw_expander"` plus
+     `on_change=clear_password_fields`; a keyed container with an `on_change` is what
+     makes opening/closing it rerun the app and expose its state (Streamlit 1.59.2,
+     `elements/layouts.py:988` and `:1319`);
+   - the fields are rendered only when `password_section.open` is true, so a closed
+     section stops rendering them and Streamlit drops their state — reopening always
+     starts blank.
+6. **`PASSWORD_HELP`** is read from `stauth.params.PASSWORD_INSTRUCTIONS` rather than
+   retyped, so the on-screen rules can never drift from the enforced rule.
+7. **Logout deliberately does NOT wipe the password keys** (comment in
+   `clear_result_on_logout` says why): the library applies its logout mid-run, so the
+   user menu is still on screen during that run and popping those keys would leave
+   widgets whose state no longer exists — the v2 "ghost widget" crash. It is also
+   unnecessary: once the entry hub takes over the form is not rendered, and Streamlit
+   drops any widget state after one run without the widget. Verified by test.
+
+### (d) Verification
+- scripts/test_dashboard.py: **133/133 checks pass** (was 113), console clean (only
+  the known AppTest cookie noise). New section 13 covers: section closed by default;
+  opening renders three empty masked fields (proto type 1); "Show passwords" flips all
+  three to plain text (type 0); wrong current password → error, typed values kept,
+  stored hash untouched; mismatch → error; weak new password → the library's policy
+  error; success → confirmation, all three fields empty, new bcrypt hash persisted,
+  old password dead; the confirmation does not persist to the next run; typing then
+  closing the section stops rendering the fields AND drops their session state, and
+  reopening shows empty fields; logout after using the form is exception-free; the new
+  password logs the account in. The section-2 check was split in two (the section is
+  now collapsed by default, so the fields are legitimately absent until it is opened).
+- Headless boot: `streamlit run` → /healthz 200, / 200, no startup errors.
+
+### (e) Design decisions
+- **Keep the library controller, replace only the view**: the widget's markup was the
+  problem, not its validation. This keeps the bcrypt check and password policy
+  identical to before while making the three inputs addressable.
+- **Errors keep the typed values, success clears them**: the student asked for
+  clearing on success; wiping all three fields because one character of the current
+  password was wrong would be worse UX than the bug being fixed.
+- **Two clearing mechanisms, not one**: the `on_change` callback is what fires in a
+  browser, but AppTest cannot click an expander header, so the `.open` gating (which
+  AppTest *can* drive through session state) is what makes the behaviour testable —
+  and each mechanism is independently sufficient.
+
+### (f) Limitations / student actions
+- AppTest does not carry an expander's open state between runs (a browser does), so
+  the tests re-assert `pw_expander` before each run via
+  `run_with_password_section_open()`. The real click-to-collapse path is still a
+  manual browser check.
+- **Streamlit's own eye icon still renders while the fields are masked and may still
+  do nothing** — its failure could not be reproduced or explained from the source, and
+  hiding it would need the custom CSS that CLAUDE.md rules out. The "Show passwords"
+  checkbox is the supported way to reveal them.
+- STUDENT: in a browser — tick "Show passwords" (all three fields must unmask); enter
+  a wrong current password (error, text kept); change it properly (confirmation, all
+  three fields empty); type something, collapse the section, reopen (empty); log out
+  and back in with the new password. If the built-in eye still does nothing, note the
+  browser (Edge/Chrome/Firefox) and whether it was the local or the deployed app.
+  Re-screenshot the user-menu figure for the report — the form has a new field label
+  ("Repeat new password") and a "Show passwords" checkbox.
+
+---
+
+## Dashboard v7.2: email reset-link for Forgot password + change-password polish (2026-07-18)
+
+Files: dashboards/app.py, dashboards/db.py (3 new functions), dashboards/emailer.py
+(function replaced), scripts/test_dashboard.py (suite 133 → 148), docs/DEPLOYMENT.md,
+.streamlit/secrets.toml (+[app] url), docs/PROGRESS.md. No notebook, artifact or
+dependency changes (secrets/hashlib/time are stdlib).
+
+### (a) Purpose
+Student's four requests after browser-testing v7.1: (1) forgot password should take an
+EMAIL and send a reset LINK the user opens to set their own password (old flow: enter
+username → a random new password is generated and emailed); (2) remove the built-in
+reveal eye from the Change-password fields ("Show passwords" is the working reveal);
+(3) move "Show passwords" below the inputs; (4) the change-password fields STILL
+showed old input in the browser after a successful change + collapse + reopen, despite
+v7.1's fix passing all AppTest checks. Student decisions (asked): a successful reset
+signs the user straight in; an unknown email gets an explicit
+"No account uses this email address." error.
+
+### (b) Root cause of (4) — pop vs assign
+v7.1 cleared the fields by POPPING their session keys. Popping deletes only the
+server-side copy: the browser's widget manager still remembers the typed text for
+those widget IDs and re-reports it on the next sync, resurrecting the old input.
+AppTest rebuilds widget state from the element tree on every run — after a pop the
+rebuilt tree carries the default "" — which is exactly why the suite passed while the
+browser kept the text. Fix: every clearing path now ASSIGNS empty values
+(`st.session_state["pw_current"] = ""` …), which marks the keys app-owned and pushes
+the empty value down to the frontend — Streamlit's documented clear-an-input recipe.
+Belt-and-braces: all password inputs now pass `autocomplete="off"` (what the library's
+own widgets do) so a browser password manager cannot refill them either. Bonus of
+assign-semantics: `clear_result_on_logout` can now clear the password form too
+(assignment cannot cause the v2 ghost-widget crash that popping rendered widgets
+could), so a half-typed password no longer survives logout.
+
+### (c) Change-password polish
+- Eye icons removed via the app's ONE style override (student-approved exception to
+  the "no custom HTML/CSS" rule, noted in the module docstring): a scoped
+  `st.html("<style>…")` hides the reveal button inside the two keyed containers
+  `st-key-pw_fields` / `st-key-reset_fields` only — Streamlit offers no parameter to
+  disable the eye, and the checkbox is the reveal that actually works.
+- "Show passwords" moved BELOW the fields; its value is read from session state
+  before the inputs render (clicking it reruns the app first), so the ordering is
+  purely visual.
+
+### (d) Forgot password = single-use emailed reset link
+1. **Hub tab**: email input + "Send reset link". The username is looked up in the
+   already-loaded credentials dict (emails are UNIQUE; case-insensitive compare; the
+   dict reloads every run, so no extra network call). Invalid format / unknown email →
+   explicit errors. Known → `secrets.token_urlsafe(32)` token; the users row stores
+   its SHA-256 hash + `now + 1800s` expiry (columns reset_token_hash /
+   reset_token_expires); link = `{APP_URL}/?reset_token={token}`.
+   `emailer.send_reset_link_email` (replaces send_password_email) mails it; on SMTP
+   failure the link is shown on screen — same never-dead-end fallback as before.
+2. **Landing page** (new block BEFORE the entry hub, first `st.query_params` use in
+   the app): unknown-or-expired tokens share one message ("invalid or has expired" —
+   probing tokens reveals nothing) + a "Back to log in" button that clears the URL.
+   Valid → New/Repeat password + Show passwords (same pattern/CSS as the change form),
+   policy enforced by the SAME shared validator instance the registration widget uses;
+   `stauth.Hasher.hash` → `db.update_password`, token cleared (single use), then
+   **auto sign-in** via `authentication_controller.login(token=…)` + `set_cookie()` —
+   the exact v6.3 post-registration pattern — and `st.query_params.clear()`; the next
+   run falls into the app with a one-shot "Password changed — you are signed in"
+   message (`just_reset` flag, rendered beside `just_registered`).
+3. **db.py**: set_reset_token / get_reset_request / clear_reset_token (plain
+   update/select on users, same style as update_password). Token at rest is a hash:
+   a leaked database row cannot be turned into a working link.
+4. **Config**: `APP_URL` from new `[app] url` secret (localhost fallback) — the
+   emailed link must point at the deployed address, which the server cannot discover
+   itself. DEPLOYMENT.md: users DDL gains the two columns, a boxed ALTER TABLE note
+   for the student's EXISTING project, [app] url documented for local + Cloud, gotcha
+   reworded. The library's forgot_password widget is no longer used anywhere (its
+   Helpers.generate_random_string is random-module-based; the token uses the
+   cryptographic `secrets` module instead).
+
+### (e) Verification
+- scripts/test_dashboard.py: **148/148 checks pass** (was 133), console clean.
+  Section 7 rewritten: link fallback on screen; link carries reset_token; only the
+  hash is stored (expiry in future, password hash untouched by the request); unknown
+  email + bad format errors; landing page renders instead of the hub (driven via
+  AppTest's query_params support); weak/mismatched passwords rejected on the landing
+  page; success → signed in as the user, confirmation shown, new bcrypt hash
+  persisted, old password dead, token nulled; REUSED link rejected; EXPIRED link
+  rejected (expiry forced into the past); the new password logs in through the normal
+  hub. Section 13 additions: autocomplete=off on all three fields; the scoped
+  eye-hiding style block renders; "Show passwords" verified BELOW the inputs by
+  walking the element tree in render order. The monkeypatched emailer function is now
+  send_reset_link_email (tests can never send real email).
+- Headless boot: /healthz 200, / 200, no startup errors.
+
+### (f) Limitations / student actions
+- The pop-vs-assign browser behaviour cannot be replayed under AppTest (the harness
+  has no persistent frontend widget manager) — the fix follows Streamlit's documented
+  callback-assignment pattern; final confirmation is the student's browser test below.
+- One reset request per account (a newer link replaces the older one) — fine for this
+  system, noted for the report.
+- The on-screen link fallback reveals account existence when SMTP is down; with SMTP
+  configured the flow only reveals it via the explicit unknown-email error, which the
+  student chose deliberately (report can note enumeration as a known trade-off).
+- STUDENT ACTIONS: (1) run the ALTER TABLE from DEPLOYMENT.md A2 in the Supabase SQL
+  editor (the two reset columns do not exist in your live project yet — forgot
+  password will error until then); (2) after deploying, set `[app] url` in the Cloud
+  secrets panel to the public app address; (3) browser test: request a link with your
+  real Gmail SMTP, open it, set a weak then a valid password, confirm you land signed
+  in, then try the same link again (must be rejected); (4) change-password: confirm no
+  eye icons, checkbox under the fields, and that after a successful change +
+  collapse/reopen the fields are finally EMPTY in the browser; (5) re-screenshot the
+  user-menu and forgot-password figures for the report.

@@ -24,12 +24,14 @@ covers the one-time Supabase setup and the Streamlit Community Cloud deploy.
 
 ```sql
 create table public.users (
-    username      text primary key,
-    name          text not null,
-    email         text not null unique,
-    password_hash text not null,          -- bcrypt hash only, never plaintext
-    created_at    text not null,          -- ISO string written by the app
-    onboarded     boolean not null default false
+    username            text primary key,
+    name                text not null,
+    email               text not null unique,
+    password_hash       text not null,    -- bcrypt hash only, never plaintext
+    created_at          text not null,    -- ISO string written by the app
+    onboarded           boolean not null default false,
+    reset_token_hash    text,             -- SHA-256 of the emailed reset token
+    reset_token_expires bigint            -- unix time the reset link dies
 );
 
 create table public.predictions (
@@ -70,6 +72,15 @@ alter table public.profiles    enable row level security;
 3. Open **Table Editor** and confirm the three tables exist (all empty —
    accounts are created through the app's registration form).
 
+> **Already created the tables before v7.2?** The forgot-password reset link
+> needs two extra columns on `users`. Run this once in the SQL Editor:
+>
+> ```sql
+> alter table public.users
+>     add column reset_token_hash    text,
+>     add column reset_token_expires bigint;
+> ```
+
 ### A3. Copy the credentials
 1. Go to **Project Settings → API** (or "API Keys").
 2. Copy two values:
@@ -86,6 +97,17 @@ key = "sb_secret_..."
 
 Never commit the secret key or paste it into any client-side code — it
 bypasses Row Level Security by design.
+
+Also add the app's own address — the forgot-password reset links point at it:
+
+```toml
+[app]
+url = "https://wage-prediction-dashboard-system.streamlit.app/"
+```
+
+(Locally this stays localhost; after deploying, set it to the public
+`https://….streamlit.app` address in the Cloud secrets panel, or emailed
+reset links will point at localhost.)
 
 ### A4. Verify locally
 1. `streamlit run dashboards/app.py`
@@ -108,7 +130,9 @@ bypasses Row Level Security by design.
    - Advanced settings → Python version: match `.python-version` (3.13)
 3. After the first deploy, open the app's **Settings → Secrets** and paste the
    full contents of your local `.streamlit/secrets.toml` — the `[supabase]`,
-   `[auth]` and `[smtp]` sections. Save; the app reboots with the secrets.
+   `[auth]`, `[smtp]` and `[app]` sections. **Change `[app] url` to the app's
+   public `https://….streamlit.app` address** so emailed reset links point at
+   the deployed app, not localhost. Save; the app reboots with the secrets.
 4. Open the app URL: the login hub should appear. Register an account, save a
    prediction, then **Reboot** the app from the Streamlit Cloud menu — logging
    back in must show the saved history (data now lives in Supabase, not in the
@@ -124,8 +148,9 @@ bypasses Row Level Security by design.
   **Restore** and wait ~1 minute.
 - **Rotating the cookie key** (`[auth] cookie_key`): allowed at any time; every
   browser is simply logged out once. Keep it at 32+ random characters.
-- **Forgot-password email** needs the `[smtp]` secrets (Gmail App Password).
-  Without them the app falls back to showing the new password on screen.
+- **Forgot-password email** needs the `[smtp]` secrets (Gmail App Password)
+  and a correct `[app] url`. The app emails a single-use reset link (30-minute
+  expiry); without working SMTP it falls back to showing the link on screen.
 - **The database is the single source of truth for accounts.** There are no
   seeded/demo accounts; to create an account, use the registration form. To
   delete one, remove its row in the Supabase Table Editor (its predictions and
