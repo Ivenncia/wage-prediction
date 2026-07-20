@@ -352,6 +352,11 @@ check("guest reaches the prediction form", not at.exception
       and has_button(at, "Predict my market salary"))
 check("welcome empty state shown before the first prediction",
       "Welcome" in all_text(at))
+welcome_text = all_text(at)
+check("welcome card uses the v7.4 wording",
+      "whether it is below, within or above the market range" in welcome_text
+      and "the factors behind your estimate" in welcome_text
+      and "in plain language" not in welcome_text, welcome_text[:400])
 check("transparency caption removed (no error figure, no dataset size)",
       "typical prediction error" not in all_text(at)
       and "31,406" not in all_text(at))
@@ -377,7 +382,10 @@ check("SHAP explanation computed", "error" not in result["shap"],
       result["shap"].get("error"))
 check("skill recommendations computed", "error" not in result["tips"],
       result["tips"].get("error"))
-check("hero estimate metric displayed", len(at.metric) == 1, str(len(at.metric)))
+check("hero estimate metric displayed with the v7.4 label",
+      len(at.metric) == 1
+      and at.metric[0].label == "Estimated advertised monthly salary",
+      str([m.label for m in at.metric]))
 print(f"       Data Analyst / KL / 5 yrs / python+sql -> "
       f"RM {low:,.0f} - {high:,.0f} (estimate RM {point:,.0f}), verdict {result['verdict']}")
 check("guest sees log-in-to-save prompt, not a save button",
@@ -404,6 +412,8 @@ check("no percentile language anywhere on the results page",
 check("SHAP interaction caveat removed",
       "RM effects are approximate" not in page_text
       and "background sample" not in page_text)
+check("factor figures carry the don't-add-up note (v7.4)",
+      "will not reproduce the final estimate" in page_text)
 
 # --- v6: concept-level explanation ---------------------------------------------
 check("baseline anchor sentence present",
@@ -653,6 +663,16 @@ check("fresh login resets the form (no guest leftovers, 0 years)",
       and at.slider(key="experience_input").value == 0,
       f"{session_get(at, 'job_title_input')}/{session_get(at, 'category_input')}/"
       f"{session_get(at, 'experience_input')}")
+# v7.4: the reset must ASSIGN every form key, never pop it — a popped key is
+# resurrected by the browser's widget manager (the v7.2 lesson), which is how
+# one account's inputs leaked into the next on the same tab. AppTest cannot
+# replay the browser side, so it asserts the server half: every key present.
+FORM_KEYS = ["job_title_input", "category_input", "state_input", "type_input",
+             "experience_input", "edu_input", "skills_input", "salary_input"]
+check("every form key is app-assigned after login (nothing left popped for "
+      "the browser to resurrect)",
+      all(session_get(at, k, "MISSING") != "MISSING" for k in FORM_KEYS),
+      str({k: session_get(at, k, "MISSING") for k in FORM_KEYS}))
 
 # (i-b) the same for a brand-new account, through register + onboarding-skip
 at = fresh_app()
@@ -886,6 +906,16 @@ check("profile persisted with personal fields only",
       prof == {"state": "Penang", "experience_years": 7,
                "edu_level": EDU_LEVELS.index("Diploma"), "skills": ["python"]},
       str(prof))
+# v7.4: saving the profile applies it to the prediction form immediately —
+# the student should not need to log out and back in to see it.
+go_to(at, NAV_PREDICT)
+check("saved profile applied to the form in the SAME session",
+      at.selectbox(key="state_input").value == "Penang"
+      and at.slider(key="experience_input").value == 7
+      and at.selectbox(key="edu_input").value == "Diploma"
+      and list(at.multiselect(key="skills_input").value) == ["python"],
+      f"{session_get(at, 'state_input')}/{session_get(at, 'experience_input')}/"
+      f"{session_get(at, 'edu_input')}/{session_get(at, 'skills_input')}")
 
 at = fresh_app()          # brand-new session: nothing in session state
 at.run()

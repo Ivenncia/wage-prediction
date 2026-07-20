@@ -1332,3 +1332,124 @@ the current run; the one library callback that runs mid-run (logout) therefore m
 never assign widget state. The set/del asymmetry (assign guarded, pop exempt) is
 why the bug hid behind otherwise-identical cleanup code, and the AppTest/browser
 difference in expander-state persistence is why the suite could not see it.
+
+---
+
+## docs/ARCHITECTURE.md: text-based system architecture (2026-07-19)
+
+Files: docs/ARCHITECTURE.md (new), docs/PROGRESS.md. Documentation only — no code,
+notebook, artifact or dependency changes.
+
+### (a) Purpose
+The student needs a system architecture figure for the FYP report (reference samples:
+layered diagrams with labelled arrows — data serving vs offline processing bands).
+They will draw the picture themselves; this document supplies the content and flow:
+which boxes exist, what goes in each layer, and what label each connector carries.
+
+### (b) Structure of the document
+Written so each section maps 1:1 to a diagram element:
+1. **Offline training pipeline** (band): CSV → 01_features (experience/education/
+   skill extraction, suggestion + skill-evidence artifacts) → 02_models (4-model
+   comparison, RF winner MAE ≈ RM963, quantile P25/P75 pipelines, SHAP explainer)
+   → models/ artifact store, with the "app loads only artifacts, never the CSV" arrow.
+2. **User interface layer**: entry hub (login/register/forgot/guest), onboarding
+   card, 5-page top nav, sidebar form groups, result views.
+3. **Application layer** (app.py, one Streamlit process) as 6 sub-boxes:
+   authentication manager, prediction engine, XAI engine (8-concept grouping),
+   career advice engine (3 levers), what-if comparison, session/state manager —
+   plus the db.py and emailer.py helper modules.
+4. **Data & external services**: Supabase Postgres (users / predictions / profiles,
+   RLS locked, secret key), Gmail SMTP with on-screen fallback, secrets/config split.
+5. **Deployment view**: browser → Streamlit Community Cloud → Supabase (Singapore)
+   + Gmail; offline band stays on the developer machine.
+6. **Five numbered end-to-end flows** (login, predict, save/history/what-if,
+   forgot-password, profile/account maintenance) — the cross-diagram arrows.
+
+### (c) Accuracy basis
+Content cross-checked against the v7.3 state recorded in this log and the real file
+listing (dashboards/ has exactly app.py, db.py, emailer.py, config.yaml; the 10
+models/ artifacts are named as they exist on disk). Deliberately absent because they
+no longer exist: SQLite/init_db, demo accounts, the model-transparency caption.
+Numbers quoted (31,406 rows, MAE ≈ RM963, 84 input columns, 75 skills) match the
+v4 retrain results.
+
+### (d) Notes for the student
+- Each "Box"/"Arrows" entry is meant to become one shape/connector in Whimsical or
+  draw.io; the two-band offline/online split mirrors the sample figures.
+- Edit freely — nothing in the app reads this file.
+
+---
+
+## Dashboard v7.4: profile autofill fix (assign-not-pop), copy updates, SHAP note (2026-07-20)
+
+Files: dashboards/app.py, scripts/test_dashboard.py (suite 150 → 154),
+docs/PROGRESS.md. No notebook, db.py, emailer.py, artifact or dependency changes.
+
+### (a) Purpose
+Student's browser test of the deployed app found: (1) profile autofill broken —
+after login the form showed the PREVIOUS session's prediction inputs (even from a
+different account on the same browser tab) instead of the logged-in user's saved
+profile, and saving the profile did not fill the form in the same session;
+(2) hero metric should read "Estimated advertised monthly salary"; (3) welcome
+card copy replaced with the student's own wording; (4) the RM figures in "Why this
+estimate?" do not add up to the displayed estimate. Student decisions (asked):
+for (4) keep the per-factor math and add back an explanatory note (a similar
+caption was removed in v6.3); for (1) the repro was both "saved profile, no
+re-login" and the cross-account leak on the same tab.
+
+### (b) Root cause of (1) — the v7.2 pop-vs-assign lesson, again
+The v6.1 fresh-login reset POPPED the 8 form widget keys before applying the
+profile. Popping deletes only the server-side copy: the browser's widget manager
+still remembers values for those widget IDs and re-reports them on the next sync,
+resurrecting the previous visitor's inputs and overriding the prefill — exactly
+the mechanism documented for the change-password fields in v7.2. The logout run
+makes the stale frontend state inevitable: streamlit-authenticator applies logout
+mid-run, so the form renders once more in that run. AppTest rebuilds widget state
+from the element tree each run (no persistent frontend), which is why all 150
+checks passed while the browser failed — the same AppTest/browser gap as v7.2.
+The onboarding wipe (complete_onboarding) had the same popping pattern.
+
+### (c) What changed (dashboards/app.py)
+1. `form_defaults()` + `reset_form_to_defaults()`: one blank-form value per widget
+   key (title None, category first option, Full time, state first option, 0 years,
+   Not specified, no skills, RM 0 — matches the v6.2 blank form). Every pre-run
+   clearing path now ASSIGNS these values instead of popping: the fresh-login
+   reset (then overlays the profile's personal fields, same logic as before) and
+   complete_onboarding (pending-save guest contract kept; last_result is server
+   state and stays a pop). Logout keeps popping only — v7.3 rule: it runs mid-run,
+   where assigning to instantiated widget keys raises StreamlitAPIException; safe
+   because the next login now assigns everything.
+2. `save_profile_from_page` also writes the four personal values straight into the
+   form keys, so a saved profile shows up on the Predict page immediately, not
+   only after the next login (legal: the form never renders on the Profile page).
+   Success message reworded accordingly.
+3. Copy: hero metric label → "Estimated advertised monthly salary"; welcome card
+   bullets replaced with the student's wording ("a verdict on a salary you were
+   offered, whether it is below, within or above the market range", "the factors
+   behind your estimate" — "in plain language" dropped).
+4. "Why this estimate?": one new caption under the factor rows — each figure shows
+   how much of the estimate rests on that factor by itself; the factors strengthen
+   and offset one another, so adding them up will not reproduce the final estimate
+   exactly. No math changes (concept grouping and point·(1−exp(−v)) untouched);
+   wording deliberately avoids the v6.3-removed phrases the suite bans.
+
+### (d) Verification
+- scripts/test_dashboard.py: **154/154 checks pass** (was 150). New: welcome card
+  v7.4 wording (and "in plain language" absent); metric label asserted exactly;
+  the don't-add-up note renders while the banned v6.3 phrases stay absent; after a
+  fresh login ALL 8 form keys are present in session state (assignment semantics —
+  nothing left popped for a browser to resurrect); Profile save applies to the
+  form in the SAME session (Profile page → Save → Predict page shows the values).
+  All v6.1/6b regressions (guest-leak reset, onboarding-skip clean form,
+  pending-save contract, logout wipe) still green on the assign-based reset.
+- Headless boot: streamlit run → /healthz 200, / 200, no startup errors.
+
+### (e) Limitations / student actions
+- The browser-side resurrection itself cannot be replayed under AppTest (no
+  persistent frontend widget manager) — the fix follows the same documented
+  assignment pattern that fixed the v7.2 password-field bug in the browser.
+- STUDENT browser test on the deployed app: (1) log in as account A, type some
+  inputs / predict, log out; log in as account B on the same tab — the form must
+  show B's saved profile (or a blank form), none of A's inputs; (2) Profile page →
+  change values → Save — the Predict form must show them immediately; (3) check
+  the new metric label, welcome text and the note under "Why this estimate?".

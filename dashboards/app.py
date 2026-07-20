@@ -377,9 +377,11 @@ def complete_onboarding(username_done, save_profile_too):
     A brand-new account must start with a CLEAN prediction form: the session
     keep-alive preserves form values across pages, so anything typed earlier
     in this browser session (e.g. while browsing as a guest) would otherwise
-    leak into the new account. The one exception is a guest who clicked
-    'Log in / Register to save' — they registered exactly to keep their
-    prediction, so their inputs and result survive to be auto-saved."""
+    leak into the new account. The form is reset by ASSIGNING blank values
+    (see form_defaults — a popped key can be resurrected by the browser).
+    The one exception is a guest who clicked 'Log in / Register to save' —
+    they registered exactly to keep their prediction, so their inputs and
+    result survive to be auto-saved."""
     if save_profile_too:
         edu_choice = st.session_state.get("onboard_edu", EDU_LEVELS[0])
         db.save_profile(username_done, {
@@ -390,21 +392,35 @@ def complete_onboarding(username_done, save_profile_too):
         })
     db.mark_onboarded(username_done)
     if not st.session_state.get("pending_save"):
-        for key in FORM_WIDGET_KEYS + ["last_result"]:
-            st.session_state.pop(key, None)
+        reset_form_to_defaults()
+        st.session_state.pop("last_result", None)
 
 
 def save_profile_from_page(username_to_save):
     """'Save profile' callback on the Profile page. Only personal facts are
     stored — job title, category and employment type are prediction-specific
-    and deliberately not part of the profile."""
+    and deliberately not part of the profile.
+
+    The saved values are also written straight into the prediction form, so
+    the change is visible on the Predict page immediately — not only after
+    the next login. Safe here: the form widgets never render on the Profile
+    page, so these keys are free to assign in a callback."""
     edu_choice = st.session_state.get("profile_edu", EDU_LEVELS[0])
+    state_choice = st.session_state.get("profile_state")
+    skills_choice = list(st.session_state.get("profile_skills", []))
+    experience_choice = int(st.session_state.get("profile_exp", 0))
     db.save_profile(username_to_save, {
-        "state": st.session_state.get("profile_state"),
-        "experience_years": int(st.session_state.get("profile_exp", 0)),
+        "state": state_choice,
+        "experience_years": experience_choice,
         "edu_level": EDU_LEVELS.index(edu_choice) if edu_choice in EDU_LEVELS else 0,
-        "skills": list(st.session_state.get("profile_skills", [])),
+        "skills": skills_choice,
     })
+    if state_choice in state_options:
+        st.session_state["state_input"] = state_choice
+    st.session_state["experience_input"] = max(0, min(experience_choice, 20))
+    st.session_state["edu_input"] = (edu_choice if edu_choice in EDU_LEVELS
+                                     else EDU_LEVELS[0])
+    st.session_state["skills_input"] = [s for s in skills_choice if s in all_skills]
     st.session_state["profile_saved"] = True
 
 
@@ -666,6 +682,34 @@ EXCLUDED_STATE_OPTIONS = {"Malaysia", "Others"}
 state_options = [s for s in options["states"] if s not in EXCLUDED_STATE_OPTIONS]
 
 
+def form_defaults():
+    """What a truly blank prediction form holds — one value per widget key.
+
+    Resetting the form means ASSIGNING these values, never popping the keys:
+    popping only deletes the server-side copy, and the browser's widget
+    manager re-reports whatever was typed before on the next sync (the v7.2
+    lesson). That is exactly how one visitor's inputs used to reappear for
+    the next account on the same browser tab. An assigned value is pushed
+    down to the browser and genuinely replaces the old one."""
+    return {
+        "job_title_input": None,       # selectbox with index=None starts empty
+        "category_input": options["categories"][0],
+        "state_input": state_options[0],
+        "type_input": ("Full time" if "Full time" in options["types"]
+                       else options["types"][0]),
+        "experience_input": 0,
+        "edu_input": EDU_LEVELS[0],
+        "skills_input": [],
+        "salary_input": 0,
+    }
+
+
+def reset_form_to_defaults():
+    """Overwrite every prediction-form key with its blank-form value."""
+    for key, value in form_defaults().items():
+        st.session_state[key] = value
+
+
 # --------------------------------------------------- onboarding (first login)
 # Newly registered accounts get one optional setup step before the app: the
 # personal facts that make up a profile. Everything can be skipped; either
@@ -710,18 +754,19 @@ if logged_in and st.session_state.pop("pending_save", False):
 
 # Fresh-login form reset + profile prefill, once per login session. This must
 # run BEFORE the form widgets are created — that is the moment Streamlit
-# allows programmatic writes to widget keys. A login is a fresh start: any
-# inputs still sitting in the session (typed as a guest, or left over from
-# whoever used this browser tab before) are dropped first, then the user's
-# own saved profile fills the PERSONAL fields (education, location,
-# experience, skills) — job title, category and employment type always start
-# fresh. The one exception: a guest whose unsaved prediction is on screen
-# keeps their result and inputs (that is what they logged in for).
+# allows programmatic writes to widget keys. A login is a fresh start: every
+# form key is ASSIGNED its blank-form value first (assigning, not popping, is
+# what actually reaches the browser — a popped key lets the browser resurrect
+# whatever the previous visitor on this tab typed, which is how one account's
+# inputs used to leak into the next), then the user's own saved profile fills
+# the PERSONAL fields (education, location, experience, skills) — job title,
+# category and employment type always start fresh. The one exception: a guest
+# whose unsaved prediction is on screen keeps their result and inputs (that
+# is what they logged in for).
 if logged_in and not st.session_state.get("profile_applied"):
     st.session_state["profile_applied"] = True
     if not st.session_state.get("last_result"):
-        for key in FORM_WIDGET_KEYS:
-            st.session_state.pop(key, None)
+        reset_form_to_defaults()
         profile = db.load_profile(username)
         if profile:
             if profile["state"] in state_options:
@@ -1424,9 +1469,9 @@ if page == NAV_PREDICT:
                      "**Predict my market salary**. You will get:")
             st.markdown(
                 "- your predicted monthly salary range on the Malaysian market\n"
-                "- a verdict on a salary you were offered — below, within or "
-                "above the market range\n"
-                "- the factors behind your estimate, in plain language\n"
+                "- a verdict on a salary you were offered, whether it is "
+                "below, within or above the market range\n"
+                "- the factors behind your estimate\n"
                 "- career improvement opportunities backed by real job-ad data")
     else:
         inputs = result["inputs"]
@@ -1438,7 +1483,7 @@ if page == NAV_PREDICT:
 
         # ------------------------------------------------------ hero result card
         with st.container(border=True):
-            st.metric("Estimated market salary (monthly)", f"RM {point:,.0f}")
+            st.metric("Estimated advertised monthly salary", f"RM {point:,.0f}")
             fig = plot_salary_range(low, point, high, offered if offered > 0 else None)
             st.pyplot(fig)
             plt.close(fig)
@@ -1501,6 +1546,17 @@ if page == NAV_PREDICT:
                         st.markdown(f"{icon} {r['sentence']}")
                         sign = "+" if r["rm"] >= 0 else "−"
                         st.caption(f"≈ {sign}RM {abs(r['rm']):,.0f} ({r['pct']:+.0f}%)")
+                    if shown:
+                        # Honest note about the arithmetic: each RM figure is
+                        # "what the estimate would lose without this factor
+                        # alone", and the factors influence each other — so
+                        # the figures are not meant to sum to the estimate.
+                        st.caption("Each figure shows how much of your "
+                                   "estimate rests on that one factor by "
+                                   "itself. Because the factors also "
+                                   "strengthen and offset one another, adding "
+                                   "the figures up will not reproduce the "
+                                   "final estimate exactly.")
 
                     # The same groups as a signed bar chart, for visual readers
                     fig = plot_signed_bars([(r["label"], r["pct"]) for r in shown])
@@ -1747,8 +1803,8 @@ elif page == NAV_PROFILE:
         st.button("Save profile", type="primary",
                   on_click=save_profile_from_page, args=(username,))
         if st.session_state.pop("profile_saved", False):
-            st.success("Profile saved — the prediction form will be prefilled "
-                       "on your next login.")
+            st.success("Profile saved — the prediction form now uses these "
+                       "details, and they will be prefilled on every login.")
 
 # ================================================================== about page
 # Deliberately short and disclaimer-toned (v6.1): users need to know what the
