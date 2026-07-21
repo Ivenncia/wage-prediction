@@ -414,6 +414,12 @@ check("SHAP interaction caveat removed",
       and "background sample" not in page_text)
 check("factor figures carry the don't-add-up note (v7.4)",
       "will not reproduce the final estimate" in page_text)
+check("'Why this estimate?' shows the how-to-read legend (v7.5)",
+      "How to read this" in page_text
+      and "depends on that single factor" in page_text)
+check("experience chart carries the under-representation disclaimer (v7.5)",
+      "holding everything else in your profile fixed" in page_text
+      and "under-represented" in page_text)
 
 # --- v6: concept-level explanation ---------------------------------------------
 check("baseline anchor sentence present",

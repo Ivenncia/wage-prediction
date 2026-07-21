@@ -1453,3 +1453,48 @@ The onboarding wipe (complete_onboarding) had the same popping pattern.
   show B's saved profile (or a blank form), none of A's inputs; (2) Profile page →
   change values → Save — the Predict form must show them immediately; (3) check
   the new metric label, welcome text and the note under "Why this estimate?".
+
+---
+
+## Dashboard v7.5: chart how-to-read captions (2026-07-22)
+
+Files: dashboards/app.py (two captions), scripts/test_dashboard.py (suite 154 → 156),
+docs/PROGRESS.md. No model, artifact, dependency or logic changes — microcopy only.
+
+### (a) Purpose
+The student asked how the SHAP "Why this estimate?" figures and the "Salary vs
+experience" curve are produced (multiplicative log-salary SHAP; RF re-prediction of
+the same profile at 0–20 years), then chose two pieces of explanatory microcopy so
+users can read the charts correctly.
+
+### (b) What changed
+1. **"Why this estimate?" how-to-read legend** — a new `st.caption` in the `if shown:`
+   block, placed BEFORE the v7.4 don't-add-up note (order: factor rows → legend →
+   don't-add-up note → bar chart): "**Blue** raises your estimate, **red** lowers it /
+   **%** — how much a factor multiplies the salary up or down / **RM** — how much of
+   your estimate depends on that single factor". The student's chosen option had a
+   fourth "figures don't add up" bullet; it was dropped because the existing note
+   already states that in full. Placement rationale: blue/red is the bar chart's key
+   (two lines below), while the ▲/▼ row markers already carry direction, so the legend
+   works as the section's colour/number key.
+2. **"Salary vs experience" disclaimer** — the thin one-line caption ("Each point
+   re-predicts your exact profile…") replaced with a fuller one: "This curve shows the
+   model's expected salary as experience changes, holding everything else in your
+   profile fixed. It mirrors the job ads it learned from, where high-experience
+   salaries are under-represented." This answers the student's "why the same
+   rise-then-dip shape every time" question in-app (root cause: training ads are
+   concentrated at 0–2 years — median 1, 75th pct 2 — and senior roles rarely
+   advertise pay, so RF has little/biased data past ~10 years).
+
+### (c) Verification
+- scripts/test_dashboard.py: **156/156 checks pass** (was 154). New: the how-to-read
+  legend renders ("How to read this" + "depends on that single factor"); the
+  experience disclaimer renders ("holding everything else in your profile fixed" +
+  "under-represented"). No collision with the v6.3 absence checks (the legend says
+  "Blue raises", not "blue band"; no percentile/background-sample phrasing), and the
+  v7.4 don't-add-up note check still passes.
+- Headless boot: streamlit run → /healthz 200, console clean.
+
+### (d) Notes
+- STUDENT: re-screenshot the "Why this estimate?" and "Salary vs experience" figures
+  for the report — both now carry an explanatory caption.

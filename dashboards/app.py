@@ -1547,6 +1547,17 @@ if page == NAV_PREDICT:
                         sign = "+" if r["rm"] >= 0 else "−"
                         st.caption(f"≈ {sign}RM {abs(r['rm']):,.0f} ({r['pct']:+.0f}%)")
                     if shown:
+                        # Short legend for the numbers above and the coloured
+                        # bar chart below: blue/red = direction, % = the
+                        # multiplier, RM = how much of the estimate leans on
+                        # that one factor. The "don't add up" caveat follows.
+                        st.caption("**How to read this:**\n\n"
+                                   "- **Blue** raises your estimate, "
+                                   "**red** lowers it\n"
+                                   "- **%** — how much a factor multiplies "
+                                   "the salary up or down\n"
+                                   "- **RM** — how much of your estimate "
+                                   "depends on that single factor")
                         # Honest note about the arithmetic: each RM figure is
                         # "what the estimate would lose without this factor
                         # alone", and the factors influence each other — so
@@ -1597,8 +1608,11 @@ if page == NAV_PREDICT:
                 st.pyplot(plot_experience_curve(result["exp_curve"],
                                                 inputs["experience_years"]))
                 plt.close("all")
-                st.caption("Each point re-predicts your exact profile with a "
-                           "different number of years of experience.")
+                st.caption("This curve shows the model's expected salary as "
+                           "experience changes, holding everything else in "
+                           "your profile fixed. It mirrors the job ads it "
+                           "learned from, where high-experience salaries are "
+                           "under-represented.")
 
         # ------------------------------------------------------ career advice
         with st.container(border=True):
