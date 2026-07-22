@@ -1498,3 +1498,89 @@ users can read the charts correctly.
 ### (d) Notes
 - STUDENT: re-screenshot the "Why this estimate?" and "Salary vs experience" figures
   for the report — both now carry an explanatory caption.
+
+---
+
+## Dashboard v7.6: charts capped at 10 years, "Compare Predictions" rename, leaner advice copy (2026-07-22)
+
+Files: dashboards/app.py, scripts/test_dashboard.py (suite 156 → 158),
+docs/ARCHITECTURE.md, docs/PROGRESS.md. No notebook, db.py, emailer.py, artifact
+or dependency changes — chart display + wording only (git diff verified: no
+prediction-math lines touched).
+
+### (a) Purpose
+Student's six-point polish list after browser-testing v7.5:
+(1) stop the "Salary vs experience" chart at 10 years — only 335/25,124 training
+records (1.33%) have 10+ years of experience and 144 (0.57%) have 15+, so the
+curve past 10 is drawn from almost no data — and cut its disclaimer down to the
+single "holding everything else in your profile fixed" sentence; (2) replace the
+page name "What-if Analysis" (users don't understand it) — student picked
+**"Compare Predictions"** from four suggested options; (3) comparison-page
+expander "Salary vs experience, all scenarios (optional detail)" → "Salary vs
+experience"; (4) "Career improvement opportunities" → "Career improvement";
+(5) drop the "— a positive model effect alone is never enough." tail from the
+skill-advice caption; (6) remove the per-skill "Based on N higher-paying
+advertisements that mention this skill." caption. Student also confirmed via
+question: the 10-year cap applies to BOTH experience charts (Predict page and
+the comparison page), not just the Predict one.
+
+### (b) What changed (dashboards/app.py)
+1. **Chart cap.** New constant `CHART_MAX_YEARS = 10` beside the other honesty
+   thresholds. `plot_experience_curve` and `plot_curves_comparison` now plot
+   `curve[:11]` with x-ticks 0–10 (step 2), and draw the "You now" / scenario
+   marker only when that profile's experience is ≤ 10 — an 11–20-year profile
+   shows the curve without a marker instead of crashing on an out-of-range
+   index. The curves are STILL COMPUTED at 0–20 (21 points, both on the Predict
+   page and in compare_scenarios): the experience-outlook lever keeps reading
+   `curve[years + 2]` past the chart's edge, so advice for 10–19-year profiles
+   is unchanged, and the 21-value test contract holds.
+2. **Disclaimer** under the Predict-page chart reduced to: "This curve shows
+   the model's expected salary as experience changes, holding everything else
+   in your profile fixed." (the "under-represented" sentence is gone — product
+   decision; the caveat itself remains true and can still be stated in the
+   report).
+3. **Rename**: `NAV_WHATIF` → `NAV_COMPARE = "Compare Predictions"` (nav chip),
+   page subheader "Compare predictions", History-page pointer, module docstring
+   and comments. The widget key `whatif_pick` was deliberately kept — it is not
+   user-visible, and renaming widget keys invites session-state churn for zero
+   user value.
+4. Expander title → "Salary vs experience"; career section → "### Career
+   improvement" (both sentence case, matching every other header; the student's
+   message contained typos "Experince"/"Improvment" — obvious intent applied).
+   The welcome-card bullet "career improvement opportunities backed by real
+   job-ad data" stays: it is the student's own v7.4 prose, not a title.
+5. Skill cards: per-skill ad-count caption deleted; section caption now ends at
+   "...are recommended." `n_ads` stays in the tips payload — the relevance
+   filter still uses it and the test still re-verifies every displayed skill
+   against skill_stats.joblib.
+
+### (c) Verification
+- scripts/test_dashboard.py: **158/158 checks pass** (was 156). Updated checks:
+  disclaimer must contain the kept sentence AND NOT "under-represented"; career
+  title check requires "improvement opportunities" absent; evidence-card check
+  requires "Based on" and "never enough" absent; nav list / pointer checks use
+  "Compare Predictions". New (2): a 15-year profile predicts cleanly — no
+  exception, marker skipped, image count unchanged — and its exp_curve still
+  holds 21 values for the outlook lever; the section then restores the 5-year
+  prediction (fresh do_predict) so the downstream auto-save assertions are
+  untouched.
+- Headless boot: streamlit run → /healthz 200, startup log clean.
+- Console: only the known cosmetic AppTest cookie noise.
+
+### (d) Notes / limitations
+- The experience slider still goes to 20 while the charts stop at 10: an
+  11–20-year user gets an estimate and outlook that use their real value, but
+  no marker on the curve. Accepted trade-off (1.33% of training ads).
+- Observation for the record (pre-existing, NOT from this change): the suite's
+  Data Analyst / KL / 5 yrs / python+sql sample prints RM 5,350–10,241
+  (estimate RM 9,259) today, while the v4 entry recorded RM 4,806–10,146
+  (estimate RM 7,823) for the same inputs. Artifact mtimes show no retrain
+  since v4 (salary_pipeline.joblib 2026-07-15), and today's diff touches no
+  prediction code — the delta arose somewhere between the v4-era suite and now
+  (the suite itself was rewritten in v6). The suite's internal consistency
+  checks (verdict vs range, saved row vs prediction) all pass.
+- STUDENT: re-screenshot for the report — the Salary-vs-experience figure
+  (0–10 axis, one-sentence caption), the Career improvement section (new title,
+  two captions gone), the top nav + renamed Compare Predictions page, and the
+  History-page pointer. In a browser, click through: predict with 15 years
+  (curve renders without a marker), and the Compare Predictions page end to end.

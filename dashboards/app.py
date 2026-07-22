@@ -13,7 +13,7 @@ guests can predict but must log in to save results to their history. Newly regis
 onboarding step (education / location / experience / skills) that seeds their
 profile.
 
-Layout (v6): a top navigation bar (Predict / What-if Analysis / History /
+Layout (v6): a top navigation bar (Predict / Compare Predictions / History /
 Profile / About the model) with a user menu in the top-right corner. The
 prediction form lives in the sidebar of the Predict page only, grouped into
 sections; form values survive page switches through the session-state
@@ -88,7 +88,7 @@ CHART_MUTED = "#898781"     # axis ticks and captions
 CHART_GRID = "#e1e0d9"      # hairline gridlines
 CHART_BASELINE = "#c3c2b7"  # zero line / axis baseline
 
-# Scenario colors for the what-if comparison view: the first three categorical
+# Scenario colors for the Compare Predictions view: the first three categorical
 # slots of a validated colorblind-safe palette ordering. Slot 1 is the same blue
 # the other charts use. Identity is also carried by the A/B/C scenario letters,
 # so color is never the only channel.
@@ -102,17 +102,23 @@ EDU_LEVELS = ["Not specified", "SPM / secondary school", "Diploma",
 
 # Top navigation pages (the strings double as the segmented-control labels)
 NAV_PREDICT = "Predict"
-NAV_WHATIF = "What-if Analysis"
+NAV_COMPARE = "Compare Predictions"
 NAV_HISTORY = "History"
 NAV_PROFILE = "Profile"
 NAV_ABOUT = "About the model"
-NAV_PAGES = [NAV_PREDICT, NAV_WHATIF, NAV_HISTORY, NAV_PROFILE, NAV_ABOUT]
+NAV_PAGES = [NAV_PREDICT, NAV_COMPARE, NAV_HISTORY, NAV_PROFILE, NAV_ABOUT]
 
 # An RM effect below this is presented as "limited influence" instead of a
 # number — the model's typical error is ~RM960, so tiny effects would be false
 # precision. Effects between the two thresholds read as "a small effect".
 MIN_MEANINGFUL_RM = 50
 SMALL_EFFECT_RM = 250
+
+# The salary-vs-experience charts stop at this many years: only 1.33% of the
+# training ads ask for 10+ years (0.57% for 15+), so the curve beyond 10 is
+# drawn from almost no data. The curves themselves are still computed to 20
+# (the experience-outlook advice reads them past the chart's edge).
+CHART_MAX_YEARS = 10
 
 # Skill recommendations must be backed by dataset evidence: the skill has to
 # appear in at least this share of the higher-paying ads for the user's role,
@@ -130,7 +136,7 @@ SENIORITY_WORDS = {"senior", "sr", "junior", "jr", "lead", "head", "chief",
                    "internship", "trainee", "apprentice", "assistant",
                    "graduate", "fresh", "supervisor"}
 
-# Short names of the concept groups, used in the what-if takeaway sentence
+# Short names of the concept groups, used in the comparison takeaway sentence
 # ("... mainly because of job seniority and the job category").
 GROUP_TAKEAWAY_NAMES = {"seniority": "job seniority",
                         "role": "the type of role",
@@ -1045,31 +1051,35 @@ def plot_feature_bars(values, enc_values):
 
 
 def plot_experience_curve(curve, current_years):
-    """Line chart: this exact profile re-predicted at 0-20 years of experience,
-    with a marker + label at the user's current experience."""
+    """Line chart: this exact profile re-predicted at 0-10 years of experience,
+    with a marker + label at the user's current experience. The chart stops at
+    CHART_MAX_YEARS (data past that is too sparse); a profile with more years
+    than that shows the curve without a marker."""
+    shown = curve[:CHART_MAX_YEARS + 1]
     fig, ax = plt.subplots(figsize=(7, 3))
-    ax.plot(range(len(curve)), curve, color=CHART_RAISE, linewidth=2,
+    ax.plot(range(len(shown)), shown, color=CHART_RAISE, linewidth=2,
             solid_capstyle="round", solid_joinstyle="round")
-    ax.plot([current_years], [curve[current_years]], marker="o", markersize=9,
-            markerfacecolor=CHART_RAISE, markeredgecolor="white",
-            markeredgewidth=2, linestyle="none")
-    near_right = current_years > 15
-    # Put the label on the empty side of the marker: below when the curve
-    # rises ahead of it, above when it falls — so text never sits on the line
-    ahead = curve[min(current_years + 2, len(curve) - 1)]
-    label_below = ahead > curve[current_years]
-    ax.annotate(f"You now: RM {curve[current_years]:,.0f}",
-                (current_years, curve[current_years]),
-                textcoords="offset points",
-                xytext=(-10 if near_right else 10, -16 if label_below else 10),
-                ha="right" if near_right else "left",
-                fontsize=9, color=CHART_INK)
+    if current_years <= CHART_MAX_YEARS:
+        ax.plot([current_years], [shown[current_years]], marker="o", markersize=9,
+                markerfacecolor=CHART_RAISE, markeredgecolor="white",
+                markeredgewidth=2, linestyle="none")
+        near_right = current_years > CHART_MAX_YEARS - 3
+        # Put the label on the empty side of the marker: below when the curve
+        # rises ahead of it, above when it falls — so text never sits on the line
+        ahead = shown[min(current_years + 2, len(shown) - 1)]
+        label_below = ahead > shown[current_years]
+        ax.annotate(f"You now: RM {shown[current_years]:,.0f}",
+                    (current_years, shown[current_years]),
+                    textcoords="offset points",
+                    xytext=(-10 if near_right else 10, -16 if label_below else 10),
+                    ha="right" if near_right else "left",
+                    fontsize=9, color=CHART_INK)
     ax.yaxis.grid(True, color=CHART_GRID, linewidth=1)
     ax.set_axisbelow(True)
     for side, spine in ax.spines.items():
         spine.set_visible(side == "bottom")
         spine.set_color(CHART_BASELINE)
-    ax.set_xticks([0, 5, 10, 15, 20])
+    ax.set_xticks(range(0, CHART_MAX_YEARS + 1, 2))
     ax.tick_params(colors=CHART_MUTED, labelsize=9, length=0)
     ax.set_xlabel("Years of experience", fontsize=9, color=CHART_MUTED)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"RM {v:,.0f}"))
@@ -1223,21 +1233,25 @@ def plot_range_comparison(scenarios):
 
 def plot_curves_comparison(scenarios):
     """Salary-vs-experience curves of all scenarios on one shared axis, each
-    with a marker at that scenario's current experience level."""
+    with a marker at that scenario's current experience level. Stops at
+    CHART_MAX_YEARS like the main experience chart; scenarios with more years
+    than that keep their curve but get no marker."""
     fig, ax = plt.subplots(figsize=(7, 3.4))
     for i, sc in enumerate(scenarios):
         color = SCENARIO_COLORS[i]
-        ax.plot(range(len(sc["curve"])), sc["curve"], color=color, linewidth=2,
+        shown = sc["curve"][:CHART_MAX_YEARS + 1]
+        ax.plot(range(len(shown)), shown, color=color, linewidth=2,
                 solid_capstyle="round", solid_joinstyle="round", label=sc["label"])
-        ax.plot([sc["experience"]], [sc["curve"][sc["experience"]]], marker="o",
-                markersize=8, markerfacecolor=color, markeredgecolor="white",
-                markeredgewidth=2, linestyle="none")
+        if sc["experience"] <= CHART_MAX_YEARS:
+            ax.plot([sc["experience"]], [shown[sc["experience"]]], marker="o",
+                    markersize=8, markerfacecolor=color, markeredgecolor="white",
+                    markeredgewidth=2, linestyle="none")
     ax.yaxis.grid(True, color=CHART_GRID, linewidth=1)
     ax.set_axisbelow(True)
     for side, spine in ax.spines.items():
         spine.set_visible(side == "bottom")
         spine.set_color(CHART_BASELINE)
-    ax.set_xticks([0, 5, 10, 15, 20])
+    ax.set_xticks(range(0, CHART_MAX_YEARS + 1, 2))
     ax.tick_params(colors=CHART_MUTED, labelsize=9, length=0)
     ax.set_xlabel("Years of experience", fontsize=9, color=CHART_MUTED)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"RM {v:,.0f}"))
@@ -1610,13 +1624,11 @@ if page == NAV_PREDICT:
                 plt.close("all")
                 st.caption("This curve shows the model's expected salary as "
                            "experience changes, holding everything else in "
-                           "your profile fixed. It mirrors the job ads it "
-                           "learned from, where high-experience salaries are "
-                           "under-represented.")
+                           "your profile fixed.")
 
         # ------------------------------------------------------ career advice
         with st.container(border=True):
-            st.markdown("### Career improvement opportunities")
+            st.markdown("### Career improvement")
 
             # Lever 1: skills — recommended only with dataset evidence
             st.markdown("**Skills worth learning**")
@@ -1644,11 +1656,8 @@ if page == NAV_PREDICT:
                                  f"{tips_payload['group_label']} advertisements.")
                         st.write(f"Model-estimated difference: approximately "
                                  f"**+RM {rec['gain']:,.0f}**/month.")
-                        st.caption(f"Based on {rec['n_ads']} higher-paying "
-                                   f"advertisements that mention this skill.")
                 st.caption(f"Only skills that are genuinely common in higher-paying "
-                           f"advertisements for your {kind_word} are recommended — "
-                           f"a positive model effect alone is never enough.")
+                           f"advertisements for your {kind_word} are recommended.")
 
             # Lever 2: experience outlook, read off the already-computed curve
             st.markdown("**Experience outlook**")
@@ -1688,9 +1697,9 @@ if page == NAV_PREDICT:
                 st.write("A higher education level adds little for this profile — "
                          "skills and experience matter more here.")
 
-# ================================================================ what-if page
-elif page == NAV_WHATIF:
-    st.subheader("What-if analysis")
+# ===================================================== compare-predictions page
+elif page == NAV_COMPARE:
+    st.subheader("Compare predictions")
     if not logged_in:
         st.info("Log in or register, save a few predictions, and compare them "
                 "here side by side.")
@@ -1732,8 +1741,7 @@ elif page == NAV_WHATIF:
                     st.info(comparison_takeaway(scenarios))
                     st.pyplot(plot_range_comparison(scenarios))
                     plt.close("all")
-                    with st.expander("Salary vs experience, all scenarios "
-                                     "(optional detail)"):
+                    with st.expander("Salary vs experience"):
                         st.pyplot(plot_curves_comparison(scenarios))
                         plt.close("all")
 
@@ -1780,7 +1788,7 @@ elif page == NAV_HISTORY:
             col_clear.button("Clear all history", disabled=not confirm_clear,
                              on_click=db.clear_history, args=(username,))
             st.caption("To compare saved predictions side by side, open the "
-                       "**What-if Analysis** page.")
+                       "**Compare Predictions** page.")
 
 # ================================================================ profile page
 elif page == NAV_PROFILE:

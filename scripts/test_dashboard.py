@@ -1,7 +1,7 @@
 """AppTest verification for the v6 dashboard (auth hub, guest mode, top
 navigation + user menu, onboarding for new registrations, Predict page with
-concept-level explanations and evidence-based skill recommendations, What-if
-scenario comparison, History, Profile page, About page).
+concept-level explanations and evidence-based skill recommendations, Compare
+Predictions scenario comparison, History, Profile page, About page).
 
 Run from the project root:  .venv\\Scripts\\python.exe scripts\\test_dashboard.py
 
@@ -275,11 +275,11 @@ def do_register(at, first, last, email, username, password):
 EDU_LEVELS = ["Not specified", "SPM / secondary school", "Diploma",
               "Bachelor's degree", "Master's / PhD"]   # must match app.py
 NAV_PREDICT = "Predict"                                # must match app.py
-NAV_WHATIF = "What-if Analysis"
+NAV_COMPARE = "Compare Predictions"
 NAV_HISTORY = "History"
 NAV_PROFILE = "Profile"
 NAV_ABOUT = "About the model"
-NAV_PAGES = [NAV_PREDICT, NAV_WHATIF, NAV_HISTORY, NAV_PROFILE, NAV_ABOUT]
+NAV_PAGES = [NAV_PREDICT, NAV_COMPARE, NAV_HISTORY, NAV_PROFILE, NAV_ABOUT]
 
 
 def go_to(at, nav_option):
@@ -417,9 +417,9 @@ check("factor figures carry the don't-add-up note (v7.4)",
 check("'Why this estimate?' shows the how-to-read legend (v7.5)",
       "How to read this" in page_text
       and "depends on that single factor" in page_text)
-check("experience chart carries the under-representation disclaimer (v7.5)",
+check("experience chart carries the one-sentence disclaimer (v7.6)",
       "holding everything else in your profile fixed" in page_text
-      and "under-represented" in page_text)
+      and "under-represented" not in page_text)
 
 # --- v6: concept-level explanation ---------------------------------------------
 check("baseline anchor sentence present",
@@ -440,17 +440,20 @@ check("old expander/section titles are gone",
       "Detailed SHAP breakdown" not in page_text
       and "How to raise your market value" not in page_text)
 
-# --- v6: career improvement opportunities --------------------------------------
-check("career section present with the three levers",
-      "Career improvement opportunities" in page_text
+# --- v6: career improvement section --------------------------------------------
+check("career section present with the three levers (v7.6 title)",
+      "Career improvement" in page_text
+      and "improvement opportunities" not in page_text
       and "Skills worth learning" in page_text
       and "Experience outlook" in page_text and "**Education**" in page_text)
 tips = result["tips"]
 check("skill recommendations carry evidence fields",
       "recs" in tips and "group_label" in tips, str(tips.keys()))
 if tips["recs"]:
-    check("recommendation cards show frequency + supporting-ad evidence",
-          "Common in" in page_text and "Based on" in page_text
+    check("recommendation cards show frequency + model difference, no ad-count "
+          "caption or 'never enough' tail (v7.6)",
+          "Common in" in page_text and "Based on" not in page_text
+          and "never enough" not in page_text
           and "Model-estimated difference" in page_text, page_text[-600:])
     # Re-verify every displayed skill against the artifact: recommendations
     # must be backed by the data, never by a positive model effect alone.
@@ -504,6 +507,19 @@ check("form and result survive a nav round-trip",
       and len(at.metric) == 1
       and session_get(at, "last_result") is not None)
 
+# --- v7.6: charts stop at 10 years; a >10-year profile must still work ---------
+at.slider(key="experience_input").set_value(15)
+find_button(at, "Predict my market salary").click()
+at.run()
+check("15-year profile predicts cleanly (chart shows 0-10, marker skipped)",
+      not at.exception
+      and session_get(at, "last_result")["inputs"]["experience_years"] == 15
+      and len(at.get("image")) >= n_images,
+      str(at.exception))
+check("curve still computed to 20 years for the experience outlook",
+      len(session_get(at, "last_result")["exp_curve"]) == 21)
+do_predict(at)   # restore the 5-year prediction — the next section auto-saves it
+
 # --------------------------- 4: guest result survives login and AUTO-saves
 print("4. Guest result survives logging in and is saved automatically")
 find_button(at, "Log in / Register to save").click()
@@ -535,8 +551,8 @@ check("history table shows the education column",
       "Education" in hist_df.columns
       and hist_df["Education"].iloc[0] == "Bachelor's degree",
       str(list(hist_df.columns)))
-check("history page points to the What-if page for comparisons",
-      "What-if Analysis" in all_text(at))
+check("history page points to the Compare Predictions page for comparisons",
+      "Compare Predictions" in all_text(at))
 
 # ------------------------------------------------------------- 5: registration
 print("5. Registration: auto-login, multi-word usernames, duplicate, weak password")
@@ -936,8 +952,8 @@ check("personal fields prefilled; job fields start fresh",
       f"{session_get(at, 'job_title_input')}/{session_get(at, 'state_input')}/"
       f"{session_get(at, 'experience_input')}/{session_get(at, 'edu_input')}")
 
-# ------------------------------------- 11: What-if scenario comparison
-print("11. What-if page: pick 2 saved predictions, diff table + takeaway")
+# ------------------------------------- 11: Compare Predictions (scenarios)
+print("11. Compare Predictions page: pick 2 saved rows, diff table + takeaway")
 # Give demo_user a second, different history row so 2 rows can be compared.
 # edu_level=1 here + the auto-saved Bachelor's row -> both education paths run.
 db.save_prediction("demo_user", {
@@ -950,8 +966,8 @@ db.save_prediction("demo_user", {
 at = fresh_app()
 at.run()
 do_login(at, "demo_user", "demo123")
-go_to(at, NAV_WHATIF)
-check("prediction form hidden on the what-if page",
+go_to(at, NAV_COMPARE)
+check("prediction form hidden on the Compare Predictions page",
       not has_button(at, "Predict my market salary"))
 picker = at.multiselect(key="whatif_pick")
 check("scenario picker lists both saved predictions", len(picker.options) == 2,

@@ -77,7 +77,7 @@ What the user sees. All rendered by Streamlit; no separate frontend framework.
   experience, skills → saved as the user's profile; "Skip for now" available.
 
 **Box 2c — Main App (after login / as guest)**
-- Top navigation (5 pages): Predict | What-if Analysis | History | Profile |
+- Top navigation (5 pages): Predict | Compare Predictions | History | Profile |
   About the model
 - Top-right user menu: signed-in name, Change password, Logout
 - Sidebar prediction form (Predict page only), grouped into:
@@ -90,7 +90,7 @@ What the user sees. All rendered by Streamlit; no separate frontend framework.
 - Verdict badge: entered salary below / within / above the market range
 - "Why this estimate?" — plain-language concept sentences + factor bar chart
 - Advanced model explanation expander — SHAP waterfall
-- Career improvement opportunities — skill cards with real-ad evidence,
+- Career improvement — skill cards with real-ad evidence,
   experience outlook, education uplift
 
 **Arrows**
@@ -126,10 +126,11 @@ every interaction. Internal components (one sub-box each):
 **Box 3d — Career Advice Engine**
 - Skills lever: re-predicts all absent skills in one batch, keeps only skills
   with evidence from skill_stats (common in higher-paying ads of the same role)
-- Experience lever: salary-vs-experience curve (profile re-predicted at 0–20 years)
+- Experience lever: salary-vs-experience curve (profile re-predicted at
+  0–20 years; charts display 0–10, where the training data is dense)
 - Education lever: re-predict at the next education level
 
-**Box 3e — What-if Comparison**
+**Box 3e — Prediction Comparison (Compare Predictions page)**
 - 2–3 saved predictions re-predicted with the current model → what-changed diff
   table, one-line takeaway (driven by concept SHAP differences), range chart,
   optional experience curves
@@ -202,9 +203,9 @@ range + estimate + verdict → XAI Engine (SHAP → concept sentences + charts) 
 Career Advice Engine (skill evidence + experience + education levers) →
 Result Views.
 
-**Flow 3 — Save, History & What-if**
+**Flow 3 — Save, History & Compare**
 Result → predictions table (guests: "log in to save" → auto-saved after login) →
-History page lists rows → user picks 2–3 → What-if Comparison re-predicts them →
+History page lists rows → user picks 2–3 → Prediction Comparison re-predicts them →
 diff table + takeaway + range chart.
 
 **Flow 4 — Forgot password**
