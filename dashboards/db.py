@@ -1,29 +1,4 @@
-"""Supabase (Postgres) persistence for the wage prediction dashboard.
-
-Accounts and history used to live in a local SQLite file, which worked on
-localhost but not for a live deployment: Streamlit Community Cloud gives the
-app an ephemeral filesystem, so every redeploy or restart would wipe every
-user and saved prediction. The data now lives in a managed Postgres database
-on Supabase and survives redeploys.
-
-Three tables, created once in the Supabase SQL editor (see docs/DEPLOYMENT.md
-for the exact SQL and setup steps):
-- users:       registered accounts. Passwords are stored as bcrypt HASHES only —
-               the plaintext never touches the database.
-- predictions: saved prediction history, one row per prediction a logged-in
-               user chose to save.
-- profiles:    one saved input profile per user (personal facts only), used to
-               prefill the prediction form automatically on login.
-
-Access goes through the official `supabase` client, which talks to the
-database over HTTPS — no connection strings and no connection pooling to
-manage. Security model: Row Level Security is enabled on every table with no
-policies, so the project's public key can read nothing at all; this app
-authenticates with the SECRET key, which bypasses RLS. The secret key only
-ever lives server-side — in .streamlit/secrets.toml locally (git-ignored) and
-in the Secrets panel on Streamlit Community Cloud — never in the browser or
-in git.
-"""
+# Supabase (Postgres) persistence for the wage prediction dashboard
 
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -38,9 +13,6 @@ class DatabaseError(Exception):
     show a friendly setup message instead of a stack trace."""
 
 
-# Column order of the predictions table. Needed because the API returns plain
-# row dicts: with zero rows there are no keys to infer column names from, and
-# the History page still expects a DataFrame with these columns.
 PREDICTION_COLUMNS = [
     "id", "username", "created_at", "job_title", "category", "state",
     "emp_type", "experience_years", "edu_level", "skills", "salary_offered",
@@ -80,7 +52,7 @@ def _now():
             .replace(tzinfo=None).isoformat(timespec="seconds"))
 
 
-# ------------------------------------------------------------------- users
+#-------------------------------------------------------------------------------- users
 def load_credentials():
     """All accounts, in the exact dict format streamlit-authenticator expects."""
     rows = (_client().table("users")
@@ -152,7 +124,7 @@ def clear_reset_token(username):
      .eq("username", username).execute())
 
 
-# -------------------------------------------------------------- predictions
+#------------------------------------------------------------------------- predictions
 def save_prediction(username, record):
     """Save one prediction for a logged-in user. Returns the new row id
     (assigned by the database's identity column)."""
@@ -193,8 +165,6 @@ def delete_predictions(username, ids):
     from ever touching another user's rows."""
     if not ids:
         return
-    # int() also converts numpy integers from the DataFrame selection into
-    # plain Python ints the API client can serialise.
     (_client().table("predictions").delete()
      .eq("username", username).in_("id", [int(i) for i in ids]).execute())
 
@@ -204,10 +174,7 @@ def clear_history(username):
     _client().table("predictions").delete().eq("username", username).execute()
 
 
-# ----------------------------------------------------------------- profiles
-# A profile holds only PERSONAL facts — education, location, experience and
-# skills. Job title, category and employment type are prediction-specific and
-# deliberately not part of the profile (v6 decision).
+# ----------------------------------------------------------------------------- profiles
 def save_profile(username, record):
     """Save (or replace) the user's one input profile for form autofill.
     upsert = insert the row, or update it if this user already has one."""

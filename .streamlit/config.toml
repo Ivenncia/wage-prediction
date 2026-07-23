@@ -1,6 +1,3 @@
-# Native Streamlit theme for the dashboard (no custom HTML/CSS anywhere).
-# primaryColor matches the blue used in every chart (CHART_RAISE in app.py),
-# so buttons, sliders, focus rings and charts all speak the same color.
 [theme]
 base = "light"
 primaryColor = "#2a78d6"

@@ -1,8 +1,3 @@
-# Authentication config for the wage prediction dashboard (streamlit-authenticator).
-# Only non-secret cookie settings live here. The cookie SIGNING KEY is read from
-# st.secrets ([auth] cookie_key) because this file is committed to git, and the
-# key must never be public. All accounts come from in-app registration and are
-# stored in the Supabase database (see db.py) — no accounts are defined here.
 cookie:
   name: wage_dashboard_auth
   expiry_days: 30

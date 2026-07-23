@@ -1,28 +1,3 @@
-"""Explainable AI Wage Prediction Dashboard (FYP, APU).
-
-Run with:  streamlit run dashboards/app.py
-
-The app loads ONLY the artifacts saved in models/ by the notebooks — it never
-reads the training CSV. If the models have not been trained yet, it shows a
-friendly message instead of crashing.
-
-Accounts and saved predictions live in a Supabase (Postgres) database in the
-cloud (see db.py), so data survives redeploys of the app. Visitors can log in,
-register a new account, recover a forgotten password, or continue as a guest —
-guests can predict but must log in to save results to their history. Newly registered accounts get a one-time optional
-onboarding step (education / location / experience / skills) that seeds their
-profile.
-
-Layout (v6): a top navigation bar (Predict / Compare Predictions / History /
-Profile / About the model) with a user menu in the top-right corner. The
-prediction form lives in the sidebar of the Predict page only, grouped into
-sections; form values survive page switches through the session-state
-keep-alive below. Styling comes from native Streamlit theming
-(.streamlit/config.toml) and bordered containers; the single CSS override in
-the app hides the built-in reveal eye on the password forms (student-approved
-exception — they have their own "Show passwords" checkbox).
-"""
-
 import hashlib
 import re
 import secrets
@@ -44,63 +19,47 @@ from yaml.loader import SafeLoader
 APP_DIR = Path(__file__).parent
 MODELS_DIR = APP_DIR.parent / "models"
 
-# Make the sibling modules importable no matter where streamlit was started from
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-import db        # Supabase persistence (users + prediction history + profiles)
-import emailer   # forgot-password email via smtplib
+import db        # Supabase persistence
+import emailer   # forgot-password email
 
-# Every artifact the dashboard needs, by the exact names the notebooks save them
-# under. model_comparison.csv feeds the transparency caption + the About page.
 ARTIFACT_FILES = {
-    "pipeline": "salary_pipeline.joblib",            # winner incl. preprocessing
-    "q_low": "quantile_lower_pipeline.joblib",       # P25 of the displayed range
-    "q_high": "quantile_upper_pipeline.joblib",      # P75 of the displayed range
-    "explainer": "shap_explainer.joblib",            # SHAP waterfall
-    "feature_names": "feature_names.joblib",         # labels for the waterfall
-    "options": "input_options.joblib",               # category/state/type lists
-    "skills": "skill_lists.joblib",                  # skill multiselect options
-    "titles": "job_title_suggestions.joblib",        # autocomplete + category auto-fill
-    "skill_stats": "skill_stats.joblib",             # skill evidence per role/category
+    "pipeline": "salary_pipeline.joblib",            
+    "q_low": "quantile_lower_pipeline.joblib",      
+    "q_high": "quantile_upper_pipeline.joblib",     
+    "explainer": "shap_explainer.joblib",           
+    "feature_names": "feature_names.joblib",       
+    "options": "input_options.joblib",           
+    "skills": "skill_lists.joblib",                  
+    "titles": "job_title_suggestions.joblib",        
+    "skill_stats": "skill_stats.joblib",             
 }
 
 st.set_page_config(page_title="Malaysia Wage Predictor", page_icon="💼", layout="centered")
 
-# The app's ONE style override (student-approved exception to the no-custom-CSS
-# rule): Streamlit always draws a reveal eye inside password inputs, but the
-# two password forms here have their own "Show passwords" checkbox, so the
-# built-in eye is hidden. Scoped to the two keyed containers that hold password
-# fields — no other widget is affected.
+
 st.html("<style>"
         ".st-key-pw_fields div[data-testid='stTextInputRootElement'] button,"
         ".st-key-reset_fields div[data-testid='stTextInputRootElement'] button"
         "{display:none;}"
         "</style>")
 
-# Chart styling: an accessible, colorblind-safe diverging pair (blue = raises,
-# red = lowers) plus recessive grey chrome, so the data is the loudest thing.
-CHART_RAISE = "#2a78d6"     # blue — factors pushing the salary up
-CHART_LOWER = "#e34948"     # red — factors pulling it down
-CHART_INK = "#0b0b0b"       # primary text (value labels)
-CHART_TEXT = "#52514e"      # secondary text (factor names)
-CHART_MUTED = "#898781"     # axis ticks and captions
-CHART_GRID = "#e1e0d9"      # hairline gridlines
-CHART_BASELINE = "#c3c2b7"  # zero line / axis baseline
 
-# Scenario colors for the Compare Predictions view: the first three categorical
-# slots of a validated colorblind-safe palette ordering. Slot 1 is the same blue
-# the other charts use. Identity is also carried by the A/B/C scenario letters,
-# so color is never the only channel.
+CHART_RAISE = "#2a78d6"    
+CHART_LOWER = "#e34948"   
+CHART_INK = "#0b0b0b"      
+CHART_TEXT = "#52514e"    
+CHART_MUTED = "#898781" 
+CHART_GRID = "#e1e0d9" 
+CHART_BASELINE = "#c3c2b7"
+
 SCENARIO_COLORS = ["#2a78d6", "#1baf7a", "#eda100"]
 
-# Education levels for the input selectbox. The list INDEX is the model's
-# ordinal edu_level value (0-4) — 01_features extracts the same scale from the
-# requirement text of the job ads.
 EDU_LEVELS = ["Not specified", "SPM / secondary school", "Diploma",
               "Bachelor's degree", "Master's / PhD"]
 
-# Top navigation pages (the strings double as the segmented-control labels)
 NAV_PREDICT = "Predict"
 NAV_COMPARE = "Compare Predictions"
 NAV_HISTORY = "History"
@@ -108,36 +67,20 @@ NAV_PROFILE = "Profile"
 NAV_ABOUT = "About the model"
 NAV_PAGES = [NAV_PREDICT, NAV_COMPARE, NAV_HISTORY, NAV_PROFILE, NAV_ABOUT]
 
-# An RM effect below this is presented as "limited influence" instead of a
-# number — the model's typical error is ~RM960, so tiny effects would be false
-# precision. Effects between the two thresholds read as "a small effect".
 MIN_MEANINGFUL_RM = 50
 SMALL_EFFECT_RM = 250
 
-# The salary-vs-experience charts stop at this many years: only 1.33% of the
-# training ads ask for 10+ years (0.57% for 15+), so the curve beyond 10 is
-# drawn from almost no data. The curves themselves are still computed to 20
-# (the experience-outlook advice reads them past the chart's edge).
 CHART_MAX_YEARS = 10
 
-# Skill recommendations must be backed by dataset evidence: the skill has to
-# appear in at least this share of the higher-paying ads for the user's role,
-# supported by at least this many ads. Title groups are smaller than category
-# groups (min 30 ads vs hundreds), so their count threshold is lower.
 MIN_SHARE_HIGH = 0.15
 MIN_SUPPORT_CATEGORY = 20
 MIN_SUPPORT_TITLE = 10
 
-# Title words that signal the LEVEL of a job rather than its field. TF-IDF
-# features containing one of these are explained as "job seniority"; the rest
-# of the title features are "the type of role".
 SENIORITY_WORDS = {"senior", "sr", "junior", "jr", "lead", "head", "chief",
                    "principal", "director", "manager", "executive", "intern",
                    "internship", "trainee", "apprentice", "assistant",
                    "graduate", "fresh", "supervisor"}
 
-# Short names of the concept groups, used in the comparison takeaway sentence
-# ("... mainly because of job seniority and the job category").
 GROUP_TAKEAWAY_NAMES = {"seniority": "job seniority",
                         "role": "the type of role",
                         "category": "the job category",
@@ -148,7 +91,7 @@ GROUP_TAKEAWAY_NAMES = {"seniority": "job seniority",
                         "emp_type": "the employment type"}
 
 
-# ------------------------------------------------------------ auth + database
+#------------------------------------------------------------------------- auth + database
 def load_auth_config():
     with open(APP_DIR / "config.yaml", encoding="utf-8") as f:
         return yaml.load(f, Loader=SafeLoader)
@@ -156,10 +99,6 @@ def load_auth_config():
 
 config = load_auth_config()
 
-# The database (Supabase) is the single source of truth for accounts — every
-# account comes from in-app registration. If the database is unreachable or
-# not configured, stop with a setup message instead of a stack trace (the
-# same friendly-gate pattern as the missing-artifacts check further down).
 try:
     credentials = db.load_credentials()
 except db.DatabaseError as exc:
@@ -171,10 +110,6 @@ except Exception:
              "your internet connection, and that the Supabase project is not "
              "paused.")
     st.stop()
-
-# The cookie signing key lives in st.secrets, NOT in config.yaml: config.yaml
-# is committed to git, and anyone who knows the signing key could forge a
-# login cookie on the live app.
 try:
     cookie_key = st.secrets["auth"]["cookie_key"]
 except (KeyError, FileNotFoundError):
@@ -194,11 +129,6 @@ class MultiWordUsernameValidator(stauth.Validator):
         return bool(re.match(r"^[a-zA-Z0-9_-]{1,20}( [a-zA-Z0-9_-]{1,20}){0,2}$",
                              username))
 
-
-# One shared validator instance: the Authenticate widget uses it for
-# registration, and the forgot-password / reset-link forms call its
-# validate_email / validate_password / diagnose_password directly, so every
-# entry point enforces the identical rules.
 validator = MultiWordUsernameValidator()
 
 authenticator = stauth.Authenticate(
@@ -209,16 +139,13 @@ authenticator = stauth.Authenticate(
     validator=validator,
 )
 
-# ---------------------------------------------------- password-reset settings
-# The emailed reset link must point back at THIS app. The address cannot be
-# discovered from inside a request, so it lives in secrets: localhost while
-# developing, the *.streamlit.app address once deployed.
+# ---------------------------------------------------------------------- password reset setting
 try:
     APP_URL = st.secrets["app"]["url"].rstrip("/")
 except (KeyError, FileNotFoundError):
     APP_URL = "http://localhost:8501"
 
-RESET_LINK_TTL_SECONDS = 30 * 60   # a reset link dies 30 minutes after it is requested
+RESET_LINK_TTL_SECONDS = 30 * 60  
 
 
 def hash_reset_token(token):
@@ -226,19 +153,12 @@ def hash_reset_token(token):
     database still cannot reconstruct a working reset link from a stored row."""
     return hashlib.sha256(token.encode()).hexdigest()
 
-# The password rules shown next to the "New password" field. Read from the
-# library rather than retyped here, so the help text can never drift away from
-# the rule the library actually enforces.
 PASSWORD_HELP = authenticator.attrs.get("password_instructions",
                                         stauth.params.PASSWORD_INSTRUCTIONS)
 
 
-# Every prediction-form widget key: the keep-alive loop below preserves these
-# across page switches, and logout wipes them in one place.
 FORM_WIDGET_KEYS = ["job_title_input", "category_input", "state_input", "type_input",
                     "experience_input", "edu_input", "skills_input", "salary_input"]
-# The onboarding and Profile-page editors have their own keys — they are
-# seeded from the database, so they only need wiping on logout.
 ONBOARD_WIDGET_KEYS = ["onboard_edu", "onboard_state", "onboard_exp", "onboard_skills"]
 PROFILE_WIDGET_KEYS = ["profile_edu", "profile_state", "profile_exp", "profile_skills"]
 def clear_password_fields():
@@ -301,12 +221,11 @@ def submit_password_change(user):
             st.session_state.get("pw_new", ""),
             st.session_state.get("pw_repeat", ""),
         )
-    except Exception as exc:   # wrong current password, weak new one, mismatch, ...
-        # Keep whatever was typed: usually only one field needs correcting.
+    except Exception as exc:  
         st.session_state["pw_message"] = ("error", str(exc))
         return
     db.update_password(user, credentials["usernames"][user]["password"])
-    clear_password_fields()   # assigns "" — the browser really clears (v7.2 fix)
+    clear_password_fields()  
     st.session_state["pw_message"] = ("success", "Password changed.")
 
 
@@ -337,9 +256,6 @@ def submit_password_reset(reset_username):
     db.update_password(reset_username, new_hash)
     db.clear_reset_token(reset_username)   # single use — the link dies here
     credentials["usernames"][reset_username]["password"] = new_hash
-    # Sign the user straight in: the token path is the library's own
-    # cookie-restore mechanism (the same pattern as auto-login after
-    # registration, v6.3), and set_cookie keeps the session across a refresh.
     authenticator.authentication_controller.login(token={"username": reset_username})
     authenticator.cookie_controller.set_cookie()
     st.session_state["just_reset"] = True
@@ -348,9 +264,6 @@ def submit_password_reset(reset_username):
     st.session_state["rp_show"] = False
     st.query_params.clear()
 
-
-# Button callbacks run BEFORE the next script run, so the flag is already set
-# when the page redraws — no st.rerun() needed anywhere in this app.
 def enter_guest_mode():
     st.session_state["guest_mode"] = True
 
@@ -430,11 +343,7 @@ def save_profile_from_page(username_to_save):
     st.session_state["profile_saved"] = True
 
 
-# ------------------------------------------- password-reset landing page
-# Reached from the emailed link (…?reset_token=…). It renders INSTEAD of the
-# entry hub for visitors who are not signed in; a successful reset signs the
-# user straight in through the submit callback, which also clears the token
-# from the URL — so the next run falls through to the app below.
+# -------------------------------------------------------------------- password reset landing page
 reset_token_param = st.query_params.get("reset_token")
 if reset_token_param and not st.session_state.get("authentication_status"):
     st.title("💼 Malaysia Wage Predictor")
@@ -443,17 +352,12 @@ if reset_token_param and not st.session_state.get("authentication_status"):
     reset_expired = (bool(reset_request)
                      and time.time() > (reset_request.get("reset_token_expires") or 0))
     if reset_request is None or reset_expired:
-        # Same message for unknown and expired tokens: an attacker probing
-        # random tokens learns nothing about which ones once existed.
         st.error("This reset link is invalid or has expired. You can request "
                  "a new one from the 'Forgot password' tab on the log-in page.")
         st.button("Back to log in", on_click=leave_reset_page)
     else:
         st.write("Choose a new password for your account. You will be signed "
                  "in right after.")
-        # Same reveal pattern as the change-password form: the checkbox below
-        # the fields drives the masking, read from session state BEFORE the
-        # inputs render (its click reruns the app first).
         rp_type = "default" if st.session_state.get("rp_show", False) else "password"
         with st.container(key="reset_fields"):
             st.text_input("New password", type=rp_type, key="rp_new",
@@ -468,11 +372,7 @@ if reset_token_param and not st.session_state.get("authentication_status"):
             st.error(rp_text)
     st.stop()
 
-# ------------------------------------------------------- entry screen (hub)
-# Three ways in: log in, register a new account, or continue as a guest.
-# Nothing else renders until one of them happened. The hub lives inside an
-# st.empty() so a login that succeeds DURING this run (form submit or a
-# restored cookie) can wipe it and fall through to the app in the same run.
+# ------------------------------------------------------------------------------------ entry screen page
 if not st.session_state.get("guest_mode") and not st.session_state.get("authentication_status"):
     hub = st.empty()
     with hub.container():
@@ -482,7 +382,7 @@ if not st.session_state.get("guest_mode") and not st.session_state.get("authenti
         tab_login, tab_register, tab_forgot = st.tabs(["Log in", "Register", "Forgot password"])
 
         with tab_login:
-            authenticator.login(location="main")   # also restores a valid login cookie
+            authenticator.login(location="main")  
             if st.session_state.get("authentication_status") is False:
                 st.error("Username or password is incorrect.")
 
@@ -491,22 +391,13 @@ if not st.session_state.get("guest_mode") and not st.session_state.get("authenti
                 reg_email, reg_username, reg_name = authenticator.register_user(
                     location="main", captcha=False, password_hint=False)
                 if reg_email:
-                    # The widget validated the input, hashed the password with bcrypt
-                    # and put the new account into the credentials dict — persist it.
-                    # add_user marks the account for the one-time onboarding flow.
                     db.add_user(reg_username, reg_name, reg_email,
                                 credentials["usernames"][reg_username]["password"])
-                    # Log the new account in right away — the token path is the
-                    # library's own cookie-restore mechanism (it fills the same
-                    # session-state keys a form login does), and set_cookie keeps
-                    # the session alive across a page refresh. The hub is wiped
-                    # below in this same run, so the welcome message is shown in
-                    # the app body via the one-shot flag.
                     authenticator.authentication_controller.login(
                         token={"username": reg_username})
                     authenticator.cookie_controller.set_cookie()
                     st.session_state["just_registered"] = True
-            except Exception as exc:  # RegisterError: duplicate user/email, weak password, ...
+            except Exception as exc:
                 st.error(str(exc))
 
         with tab_forgot:
@@ -515,9 +406,6 @@ if not st.session_state.get("guest_mode") and not st.session_state.get("authenti
             fp_email = st.text_input("Email", key="fp_email")
             if st.button("Send reset link", key="fp_send"):
                 entered_email = fp_email.strip().lower()
-                # Emails are unique in the users table, so at most one account
-                # matches. The credentials dict is reloaded on every run, so
-                # this needs no extra database call.
                 fp_username = next(
                     (u for u, info in credentials["usernames"].items()
                      if (info.get("email") or "").strip().lower() == entered_email),
@@ -527,8 +415,6 @@ if not st.session_state.get("guest_mode") and not st.session_state.get("authenti
                 elif fp_username is None:
                     st.error("No account uses this email address.")
                 else:
-                    # The link carries a random single-use token; only its
-                    # SHA-256 hash is stored, with a 30-minute expiry.
                     reset_token = secrets.token_urlsafe(32)
                     db.set_reset_token(fp_username, hash_reset_token(reset_token),
                                        int(time.time()) + RESET_LINK_TTL_SECONDS)
@@ -550,7 +436,7 @@ if not st.session_state.get("guest_mode") and not st.session_state.get("authenti
                        "unless you log in later.")
 
     if st.session_state.get("authentication_status"):
-        hub.empty()   # logged in during this run — clear the hub, show the app
+        hub.empty()
     else:
         st.stop()
 
@@ -558,27 +444,18 @@ logged_in = bool(st.session_state.get("authentication_status"))
 username = st.session_state.get("username")
 display_name = st.session_state.get("name", "")
 if logged_in:
-    st.session_state["guest_mode"] = False   # a real login always ends guest mode
-
-# Keep-alive for the prediction form: Streamlit drops a widget's session state
-# when the widget is not rendered during a run, and the form only renders on
-# the Predict page. Re-assigning each key marks it as app-owned state, so the
-# inputs survive visits to the other pages. Runs before any widget exists.
+    st.session_state["guest_mode"] = False 
 for _key in FORM_WIDGET_KEYS:
     if _key in st.session_state:
         st.session_state[_key] = st.session_state[_key]
 
 
-# ------------------------------------------------------ top bar: title + user
+# ---------------------------------------------------------------------------------- top bar(title + user)
 col_title, col_user = st.columns([0.74, 0.26], vertical_alignment="center")
 with col_title:
     st.title("💼 Malaysia Wage Predictor")
 with col_user:
     if logged_in:
-        # Giving the menu and the section a key plus an on_change callback is
-        # what makes collapsing them run the app again — without it Streamlit
-        # opens and closes these containers purely in the browser, and the
-        # password fields could never be cleared on close.
         with st.popover(display_name, width="stretch", key="user_menu",
                         on_change=clear_password_fields):
             st.markdown(f"Signed in as **{display_name}**")
@@ -586,30 +463,7 @@ with col_user:
             password_section = st.expander("Change password", key="pw_expander",
                                            on_change=clear_password_fields)
             with password_section:
-                # The fields exist only while the section is open. Together
-                # with the on_change callback above this is what empties the
-                # form when the user closes it: the inputs are not rendered on
-                # the next run, so Streamlit drops their state and reopening
-                # the section always starts from blank fields.
                 if password_section.open:
-                    # This form deliberately does NOT use the library's
-                    # reset_password() widget. That widget puts its three
-                    # inputs in an st.form with no keys, so their values are
-                    # unreachable from session state: they survive a
-                    # successful change and reappear when the section is
-                    # reopened. Owning the keys here fixes that, and lets one
-                    # checkbox drive the masking of all three fields.
-                    # Plain widgets rather than st.form, because a widget
-                    # inside a form does not take effect until the form is
-                    # submitted — the same reason the prediction form dropped
-                    # st.form in v2.
-                    # The "Show passwords" checkbox sits BELOW the fields, so
-                    # its value is read from session state before they render
-                    # (clicking it reruns the app, and by then the new value
-                    # is already there). autocomplete="off" keeps the browser
-                    # password manager from refilling the cleared fields. The
-                    # container key scopes the CSS that hides the built-in
-                    # reveal eye (the checkbox is the working reveal here).
                     show = st.session_state.get("pw_show", False)
                     field_type = "default" if show else "password"
                     with st.container(key="pw_fields"):
@@ -622,8 +476,6 @@ with col_user:
                     st.checkbox("Show passwords", key="pw_show")
                     st.button("Change password", key="pw_submit",
                               on_click=submit_password_change, args=(username,))
-                    # Popped, not read: the message belongs to the click that
-                    # produced it and should not linger on the next interaction.
                     kind, message = st.session_state.pop("pw_message", (None, None))
                     if kind == "success":
                         st.success(message)
@@ -635,19 +487,14 @@ with col_user:
             st.write("Browsing as **guest** — predictions are not saved.")
             st.button("Log in / Register", on_click=exit_guest_mode)
 
-# One-shot confirmation after registering: the account was created inside the
-# hub (which is wiped once the auto-login completes), so the message renders
-# here in the app body instead — above the onboarding card a new account sees.
 if logged_in and st.session_state.pop("just_registered", False):
     st.success(f"Account created — you are signed in as **{display_name}**.")
 
-# Same idea after a reset-link password change: the reset page is gone by the
-# time this run renders, so the confirmation shows here in the app body.
 if logged_in and st.session_state.pop("just_reset", False):
     st.success(f"Password changed — you are signed in as **{display_name}**.")
 
 
-# ---------------------------------------------------------- artifact loading
+#------------------------------------------------------------------------------------ artifact loading
 def missing_artifacts():
     """Checked on every rerun (NOT cached), so the app recovers as soon as
     the notebooks finish training and the files appear."""
@@ -670,20 +517,16 @@ if missing:
     st.stop()
 
 artifacts = load_artifacts()
-skills_info = artifacts["skills"]                    # hard_skills / soft_skills / skill_columns
+skills_info = artifacts["skills"]                    
 options = artifacts["options"]
-skill_columns = skills_info["skill_columns"]         # display name -> model column
+skill_columns = skills_info["skill_columns"]         
 all_skills = skills_info["hard_skills"] + skills_info["soft_skills"]
 feature_names = artifacts["feature_names"]
-title_suggestions = artifacts["titles"]["titles"]                # ordered by frequency
-title_to_category = artifacts["titles"]["title_to_category"]     # lowercased title -> category
-title_display = {t.lower(): t for t in title_suggestions}        # lowercased -> nice casing
-col_to_skill = {col: skill for skill, col in skill_columns.items()}   # skill_c_plus_plus -> "c++"
+title_suggestions = artifacts["titles"]["titles"]                
+title_to_category = artifacts["titles"]["title_to_category"]     
+title_display = {t.lower(): t for t in title_suggestions}        
+col_to_skill = {col: skill for skill, col in skill_columns.items()}   
 
-# "Malaysia" (a single ad posted for the whole country) and "Others" (the
-# cleaning phase's bucket for unmapped locations) are leftovers, not real
-# states — the dataset is Malaysia-only. They are hidden from the dropdown;
-# the model itself is untouched (OneHotEncoder ignores unknown values anyway).
 EXCLUDED_STATE_OPTIONS = {"Malaysia", "Others"}
 state_options = [s for s in options["states"] if s not in EXCLUDED_STATE_OPTIONS]
 
@@ -698,7 +541,7 @@ def form_defaults():
     the next account on the same browser tab. An assigned value is pushed
     down to the browser and genuinely replaces the old one."""
     return {
-        "job_title_input": None,       # selectbox with index=None starts empty
+        "job_title_input": None,   
         "category_input": options["categories"][0],
         "state_input": state_options[0],
         "type_input": ("Full time" if "Full time" in options["types"]
@@ -717,9 +560,7 @@ def reset_form_to_defaults():
 
 
 # --------------------------------------------------- onboarding (first login)
-# Newly registered accounts get one optional setup step before the app: the
-# personal facts that make up a profile. Everything can be skipped; either
-# button marks the account onboarded, so the flow never appears again.
+# newly registered accounts get one optional setup( the personal profile)
 if logged_in and db.needs_onboarding(username):
     with st.container(border=True):
         st.markdown(f"#### Welcome, {display_name}!")
@@ -743,9 +584,7 @@ if logged_in and db.needs_onboarding(username):
 
 
 # A guest who clicked "Log in / Register to save" gets the prediction saved
-# automatically the moment their login completes (works after registering too,
-# because the intent flag stays in the session until a login happens — even
-# across the onboarding step).
+# automatically the moment their login completes (works after registering also)
 if logged_in and st.session_state.pop("pending_save", False):
     pending = st.session_state.get("last_result")
     if pending and not pending["saved"]:
@@ -758,17 +597,7 @@ if logged_in and st.session_state.pop("pending_save", False):
         pending["auto_saved"] = True
 
 
-# Fresh-login form reset + profile prefill, once per login session. This must
-# run BEFORE the form widgets are created — that is the moment Streamlit
-# allows programmatic writes to widget keys. A login is a fresh start: every
-# form key is ASSIGNED its blank-form value first (assigning, not popping, is
-# what actually reaches the browser — a popped key lets the browser resurrect
-# whatever the previous visitor on this tab typed, which is how one account's
-# inputs used to leak into the next), then the user's own saved profile fills
-# the PERSONAL fields (education, location, experience, skills) — job title,
-# category and employment type always start fresh. The one exception: a guest
-# whose unsaved prediction is on screen keeps their result and inputs (that
-# is what they logged in for).
+# Fresh-login form reset + profile prefill, once per login session
 if logged_in and not st.session_state.get("profile_applied"):
     st.session_state["profile_applied"] = True
     if not st.session_state.get("last_result"):
@@ -823,8 +652,7 @@ def feature_group(name):
         return "location"
     if name.startswith("type_clean_"):
         return "emp_type"
-    # Everything else is a TF-IDF n-gram from the job title. Level words
-    # ("senior", "manager") read as seniority; the rest is the type of role.
+    
     for word in name.split():
         if word in SENIORITY_WORDS or (word.endswith("s") and word[:-1] in SENIORITY_WORDS):
             return "seniority"
@@ -968,7 +796,7 @@ def find_evidence_group(job_title, category):
     return None, None, None
 
 
-# ------------------------------------------------------------------- charts
+# --------------------------------------------------------------------- charts
 def plot_salary_range(low, point, high, offered=None):
     """The hero chart: one horizontal P25-P75 band with a white-ringed marker
     at the point estimate, plus (when the user entered one) a dark tick
@@ -979,15 +807,11 @@ def plot_salary_range(low, point, high, offered=None):
             solid_capstyle="round", alpha=0.9)
     ax.plot([point], [y], marker="o", markersize=11, markerfacecolor=CHART_RAISE,
             markeredgecolor="white", markeredgewidth=2, linestyle="none")
-    # Band endpoints labeled BELOW, the offer labeled ABOVE — two separate
-    # text levels, so the labels cannot collide whatever the offer is.
     ax.annotate(f"RM {low:,.0f}", (low, y), textcoords="offset points",
                 xytext=(0, -18), ha="center", fontsize=9, color=CHART_TEXT)
     ax.annotate(f"RM {high:,.0f}", (high, y), textcoords="offset points",
                 xytext=(0, -18), ha="center", fontsize=9, color=CHART_TEXT)
     if offered is not None:
-        # A vertical tick (not a filled marker) so it stays readable even when
-        # the offered salary lands exactly on the estimate marker
         ax.vlines(offered, -0.3, 0.3, color=CHART_INK, linewidth=2)
         ax.annotate(f"Your salary: RM {offered:,.0f}", (offered, 0.3),
                     textcoords="offset points", xytext=(0, 5), ha="center",
@@ -1011,7 +835,7 @@ def plot_signed_bars(pairs):
     pairs = [(label, pct) for label, pct in pairs if abs(pct) > 1e-6]
     if not pairs:
         return None
-    pairs = pairs[::-1]   # barh draws the first row at the bottom -> biggest on top
+    pairs = pairs[::-1]   
     labels = [label for label, _ in pairs]
     pcts = [pct for _, pct in pairs]
     colors = [CHART_RAISE if p > 0 else CHART_LOWER for p in pcts]
@@ -1020,7 +844,7 @@ def plot_signed_bars(pairs):
     ax.barh(range(len(pairs)), pcts, height=0.55, color=colors)
     ax.set_yticks(range(len(pairs)))
     ax.set_yticklabels(labels)
-    for y, pct in enumerate(pcts):   # value at the tip of each bar, in plain ink
+    for y, pct in enumerate(pcts):   
         ax.annotate(f"{pct:+.0f}%", (pct, y), textcoords="offset points",
                     xytext=(4 if pct > 0 else -4, 0), va="center",
                     ha="left" if pct > 0 else "right", fontsize=9, color=CHART_INK)
@@ -1064,8 +888,6 @@ def plot_experience_curve(curve, current_years):
                 markerfacecolor=CHART_RAISE, markeredgecolor="white",
                 markeredgewidth=2, linestyle="none")
         near_right = current_years > CHART_MAX_YEARS - 3
-        # Put the label on the empty side of the marker: below when the curve
-        # rises ahead of it, above when it falls — so text never sits on the line
         ahead = shown[min(current_years + 2, len(shown) - 1)]
         label_below = ahead > shown[current_years]
         ax.annotate(f"You now: RM {shown[current_years]:,.0f}",
@@ -1088,7 +910,7 @@ def plot_experience_curve(curve, current_years):
     return fig
 
 
-# ------------------------------------------------- scenario comparison helpers
+#------------------------------------------------------- scenario comparison helpers
 def scenario_label(index, job_title):
     """'A — Data Analyst': the letter ties the diff table to both charts,
     so identity never relies on color alone."""
@@ -1122,14 +944,11 @@ def compare_scenarios(rows):
         low, high = min(low, high), max(low, high)
         point = min(max(point_raw, low), high)
 
-        # Concept-level SHAP sums, same grouping as the main explanation —
-        # the takeaway sentence names the groups that differ most.
         preprocess = artifacts["pipeline"].named_steps["preprocess"]
         x_enc = np.asarray(preprocess.transform(X_row))
         sv = artifacts["explainer"].shap_values(x_enc)[0]
         group_sums = shap_group_sums(sv, job_title)
 
-        # The same profile at every experience level 0-20, one batched predict
         grid = pd.concat([X_row] * 21, ignore_index=True)
         grid["experience_years"] = list(range(21))
         grid["has_experience_req"] = [1 if y > 0 else 0 for y in range(21)]
@@ -1182,8 +1001,6 @@ def comparison_takeaway(scenarios):
     groups = set(hi["group_sums"]) | set(lo["group_sums"])
     diffs = {g: hi["group_sums"].get(g, 0.0) - lo["group_sums"].get(g, 0.0)
              for g in groups}
-    # Only groups that push the higher scenario UP relative to the lower one
-    # can be named as reasons; take the two strongest.
     drivers = [GROUP_TAKEAWAY_NAMES[g] for g, v in
                sorted(diffs.items(), key=lambda kv: -kv[1]) if v > 0.01][:2]
     if not drivers:
@@ -1206,9 +1023,6 @@ def plot_range_comparison(scenarios):
                 solid_capstyle="round")
         ax.plot([sc["point"]], [y], marker="o", markersize=9, markerfacecolor=color,
                 markeredgecolor="white", markeredgewidth=2, linestyle="none")
-        # One combined range label ABOVE the interval (labels at the ends collide
-        # with the y-axis names when an interval sits far left) and the muted
-        # point estimate BELOW the marker.
         ax.annotate(f"RM {sc['low']:,.0f} – {sc['high']:,.0f}",
                     ((sc["low"] + sc["high"]) / 2, y), textcoords="offset points",
                     xytext=(0, 11), ha="center", fontsize=9, color=CHART_INK)
@@ -1226,7 +1040,7 @@ def plot_range_comparison(scenarios):
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"RM {v:,.0f}"))
     ax.set_xlabel("Predicted monthly salary range",
                   fontsize=9, color=CHART_MUTED)
-    ax.margins(x=0.10, y=0.40)   # air for the labels above and below each interval
+    ax.margins(x=0.10, y=0.40)   
     fig.tight_layout()
     return fig
 
@@ -1283,26 +1097,17 @@ def save_result_to_history(username_to_save):
         result["saved"] = True
 
 
-# ------------------------------------------------------------ top navigation
+# ------------------------------------------------------------- top navigation
 if "nav" not in st.session_state:
     st.session_state["nav"] = NAV_PREDICT
 page = st.segmented_control("Page", NAV_PAGES, key="nav",
                             label_visibility="collapsed")
-if page is None:            # a segmented control can be de-selected by clicking
-    page = NAV_PREDICT      # the active item again — fall back to the home page
+if page is None:            
+    page = NAV_PREDICT      
 
 
 # ================================================================ predict page
 if page == NAV_PREDICT:
-    # ------------------------------------------- sidebar: the prediction form
-    # The form renders ONLY on this page; the keep-alive loop near the top of
-    # the script preserves its values while other pages are open.
-    # One sensible starting value, written to session state BEFORE the widget
-    # exists (a keyed widget reads its value from there, and this way no
-    # "default value + Session State API" warning is logged): 91% of the
-    # training ads are full-time jobs, so that is the natural default. Every
-    # other input starts genuinely blank — the experience slider and salary
-    # box sit at 0 — so a fresh form never looks like someone else's data.
     if "type_input" not in st.session_state and "Full time" in options["types"]:
         st.session_state["type_input"] = "Full time"
 
@@ -1313,8 +1118,6 @@ if page == NAV_PREDICT:
                         "prefilled from your saved profile.")
 
     sidebar.markdown("#### Job details")
-    # A restored free-text title may not be in the suggestion list — prepend it
-    # for this run so the selectbox accepts the preset value.
     title_options = title_suggestions
     preset_title = st.session_state.get("job_title_input")
     if preset_title and preset_title not in title_suggestions:
@@ -1349,9 +1152,8 @@ if page == NAV_PREDICT:
     sidebar.button("Predict my market salary", type="primary",
                    on_click=request_prediction, width="stretch")
 
-    # ------------------------------------------------------- run a prediction
-    # The predict button's callback set this flag (and jumped nav back here);
-    # the heavy work happens in the script body, not in the callback.
+    # ------------------------------------------------------- run the prediction
+    # the predict button's callback set this flag
     if st.session_state.pop("do_predict", False):
         job_title = job_title or ""
         edu_level = EDU_LEVELS.index(edu_choice) if edu_choice in EDU_LEVELS else 0
@@ -1364,8 +1166,6 @@ if page == NAV_PREDICT:
         except Exception as exc:  # any artifact/input mismatch ends here, not a crash
             st.error(f"Prediction failed — please check your inputs. ({exc})")
             st.stop()
-
-        # Display rule: lower <= point <= upper (quantile models are separate, so clip)
         low, high = min(low, high), max(low, high)
         point = min(max(point_raw, low), high)
 
@@ -1378,9 +1178,6 @@ if page == NAV_PREDICT:
                 verdict = "WITHIN"
         else:
             verdict = ""   # no salary entered, nothing to judge
-
-        # SHAP values for this one prediction (plotted from the stored numbers
-        # on every rerun, so the result survives Save clicks and logins)
         try:
             preprocess = artifacts["pipeline"].named_steps["preprocess"]
             x_enc = np.asarray(preprocess.transform(X_row))
@@ -1390,10 +1187,6 @@ if page == NAV_PREDICT:
         except Exception as exc:
             shap_payload = {"error": str(exc)}
 
-        # Skill recommendations: re-predict once per missing skill (ONE batched
-        # call), then keep only skills the dataset shows are genuinely common
-        # in higher-paying ads for this role — a positive model effect alone
-        # is never enough to recommend a skill.
         try:
             absent = [s for s in all_skills if s not in set(selected_skills)]
             group_kind, group_label, group_stats = find_evidence_group(job_title, category)
@@ -1424,19 +1217,13 @@ if page == NAV_PREDICT:
                             "group_label": group_label, "all_selected": not absent}
         except Exception as exc:
             tips_payload = {"error": str(exc)}
-
-        # Salary-vs-experience curve: the same profile re-predicted at every
-        # experience level 0-20 (one batched call), for the line chart
         try:
             grid = pd.concat([X_row] * 21, ignore_index=True)
             grid["experience_years"] = list(range(21))
             grid["has_experience_req"] = [1 if y > 0 else 0 for y in range(21)]
             exp_curve = [float(v) for v in np.exp(artifacts["pipeline"].predict(grid))]
         except Exception:
-            exp_curve = None   # chart is skipped; everything else still works
-
-        # Education lever: what happens to this exact profile one level up?
-        # (Stored now so the advice survives reruns without re-predicting.)
+            exp_curve = None   
         try:
             if edu_level < len(EDU_LEVELS) - 1:
                 X_edu = X_row.copy()
@@ -1446,7 +1233,7 @@ if page == NAV_PREDICT:
                 edu_uplift = {"next_level": EDU_LEVELS[edu_level + 1],
                               "gain": edu_point - point_raw}
             else:
-                edu_uplift = None   # already at the highest level in the data
+                edu_uplift = None 
         except Exception:
             edu_uplift = None
 
@@ -1469,14 +1256,9 @@ if page == NAV_PREDICT:
             "edu_uplift": edu_uplift,
             "saved": False,
         }
-
-    # ------------------------------------------------------------ the results
-    # Rendered from session_state, NOT from the button click: this keeps the
-    # result on screen across reruns — including a guest logging in to save it.
     result = st.session_state.get("last_result")
 
     if not result:
-        # Friendly empty state until the first prediction is made
         with st.container(border=True):
             st.markdown("#### Welcome")
             st.write("Fill in your details in the **sidebar on the left** and click "
@@ -1514,7 +1296,7 @@ if page == NAV_PREDICT:
                 st.success(f"Your salary of RM {offered:,.0f} is **within the market "
                            f"range** of RM {low:,.0f} – {high:,.0f}.")
 
-        # ---------------------------------------------------- save to history
+        # ------------------------------------------------------ save to history
         if logged_in:
             if result["saved"]:
                 if result.get("auto_saved"):
@@ -1530,7 +1312,7 @@ if page == NAV_PREDICT:
                     "result will be saved to your history automatically.")
             st.button("Log in / Register to save", on_click=request_login_to_save)
 
-        # --------------------------------------------------- SHAP explanation
+        # ----------------------------------------------------- estimated salary explanation
         with st.container(border=True):
             st.markdown("### Why this estimate?")
             shap_payload = result["shap"]
@@ -1561,10 +1343,6 @@ if page == NAV_PREDICT:
                         sign = "+" if r["rm"] >= 0 else "−"
                         st.caption(f"≈ {sign}RM {abs(r['rm']):,.0f} ({r['pct']:+.0f}%)")
                     if shown:
-                        # Short legend for the numbers above and the coloured
-                        # bar chart below: blue/red = direction, % = the
-                        # multiplier, RM = how much of the estimate leans on
-                        # that one factor. The "don't add up" caveat follows.
                         st.caption("**How to read this:**\n\n"
                                    "- **Blue** raises your estimate, "
                                    "**red** lowers it\n"
@@ -1572,10 +1350,6 @@ if page == NAV_PREDICT:
                                    "the salary up or down\n"
                                    "- **RM** — how much of your estimate "
                                    "depends on that single factor")
-                        # Honest note about the arithmetic: each RM figure is
-                        # "what the estimate would lose without this factor
-                        # alone", and the factors influence each other — so
-                        # the figures are not meant to sum to the estimate.
                         st.caption("Each figure shows how much of your "
                                    "estimate rests on that one factor by "
                                    "itself. Because the factors also "
@@ -1583,14 +1357,11 @@ if page == NAV_PREDICT:
                                    "the figures up will not reproduce the "
                                    "final estimate exactly.")
 
-                    # The same groups as a signed bar chart, for visual readers
                     fig = plot_signed_bars([(r["label"], r["pct"]) for r in shown])
                     if fig is not None:
                         st.pyplot(fig)
                         plt.close(fig)
 
-                    # The raw per-feature view stays for the detailed/report
-                    # look behind the summary (locked decision 7: waterfall)
                     with st.expander("Advanced model explanation"):
                         st.caption("The raw model view behind the summary above: "
                                    "each encoded feature's own contribution, "
@@ -1615,7 +1386,7 @@ if page == NAV_PREDICT:
                 except Exception as exc:
                     st.warning(f"Explanation unavailable for this prediction. ({exc})")
 
-        # ---------------------------------------------- salary vs experience
+        # ------------------------------------------------- salary vs experience
         if result.get("exp_curve"):
             with st.container(border=True):
                 st.markdown("### Your salary vs experience")
@@ -1630,7 +1401,6 @@ if page == NAV_PREDICT:
         with st.container(border=True):
             st.markdown("### Career improvement")
 
-            # Lever 1: skills — recommended only with dataset evidence
             st.markdown("**Skills worth learning**")
             tips_payload = result["tips"]
             if "error" in tips_payload:
@@ -1659,7 +1429,6 @@ if page == NAV_PREDICT:
                 st.caption(f"Only skills that are genuinely common in higher-paying "
                            f"advertisements for your {kind_word} are recommended.")
 
-            # Lever 2: experience outlook, read off the already-computed curve
             st.markdown("**Experience outlook**")
             curve = result.get("exp_curve")
             years = inputs["experience_years"]
@@ -1681,7 +1450,6 @@ if page == NAV_PREDICT:
                     st.write("More years of experience alone add little for this "
                              "profile — skills and the role itself matter more here.")
 
-            # Lever 3: the next education level, predicted at predict time
             st.markdown("**Education**")
             edu_now = inputs["edu_level"]
             edu_uplift = result.get("edu_uplift")
@@ -1697,7 +1465,7 @@ if page == NAV_PREDICT:
                 st.write("A higher education level adds little for this profile — "
                          "skills and experience matter more here.")
 
-# ===================================================== compare-predictions page
+#=======================================================compare predictions page
 elif page == NAV_COMPARE:
     st.subheader("Compare predictions")
     if not logged_in:
@@ -1712,8 +1480,6 @@ elif page == NAV_COMPARE:
         else:
             st.write("Pick two or three saved predictions and see exactly what "
                      "changes between them.")
-            # One human-readable label per saved row; the #id keeps labels
-            # unique even when two rows share a title and timestamp.
             row_labels = {}
             for _, row in history.iterrows():
                 when = pd.to_datetime(row["created_at"]).strftime("%d %b %Y, %H:%M")
@@ -1745,7 +1511,7 @@ elif page == NAV_COMPARE:
                         st.pyplot(plot_curves_comparison(scenarios))
                         plt.close("all")
 
-# ================================================================ history page
+#================================================================ history page
 elif page == NAV_HISTORY:
     st.subheader("My saved predictions")
     if not logged_in:
@@ -1802,9 +1568,6 @@ elif page == NAV_PROFILE:
                    "location, experience and skills. Job title, category and "
                    "employment type belong to each individual prediction and "
                    "are not stored here.")
-        # Seed the editor from the database the first time this page renders
-        # (and again after logout wiped the keys). The DB stays the source of
-        # truth; unsaved edits are discarded when the user navigates away.
         if "profile_edu" not in st.session_state:
             saved = db.load_profile(username) or {}
             edu_saved = saved.get("edu_level", 0)
@@ -1827,10 +1590,7 @@ elif page == NAV_PROFILE:
         if st.session_state.pop("profile_saved", False):
             st.success("Profile saved — the prediction form now uses these "
                        "details, and they will be prefilled on every login.")
-
-# ================================================================== about page
-# Deliberately short and disclaimer-toned (v6.1): users need to know what the
-# numbers mean and how far to trust them — not the training details.
+#===============================================================================about the model page
 else:
     st.subheader("About the model")
     st.write("The salary estimates on this dashboard are produced by a "

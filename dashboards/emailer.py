@@ -1,13 +1,3 @@
-"""Password-reset email for the dashboard, using only the Python standard library.
-
-streamlit-authenticator 0.4.x can only send emails through the library author's
-cloud service (it needs a paid `api_key`), so the email is sent here instead
-with smtplib. SMTP settings live in `.streamlit/secrets.toml` (git-ignored) —
-credentials never appear in code. When SMTP is not configured or sending
-fails, functions return False and the app falls back to showing the reset
-link on screen, so the demo works without any email setup.
-"""
-
 import smtplib
 from email.message import EmailMessage
 
@@ -62,7 +52,7 @@ def send_reset_link_email(to_email, username, reset_link):
 
     try:
         with smtplib.SMTP(str(smtp["host"]), int(smtp["port"]), timeout=15) as server:
-            server.starttls()  # upgrade to an encrypted connection before logging in
+            server.starttls()  
             server.login(smtp["user"], smtp["app_password"])
             server.send_message(message)
         return True
